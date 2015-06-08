@@ -17,11 +17,13 @@
 
 package org.apache.flink.streaming.api;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import java.lang.reflect.Field;
 import java.util.List;
 
 import org.apache.flink.api.common.functions.FilterFunction;
@@ -30,8 +32,11 @@ import org.apache.flink.api.common.functions.FoldFunction;
 import org.apache.flink.api.common.functions.Function;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
+import org.apache.flink.api.java.ExecutionEnvironment;
 import org.apache.flink.api.java.functions.KeySelector;
+import org.apache.flink.api.java.tuple.Tuple;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.api.java.typeutils.TypeExtractor;
 import org.apache.flink.streaming.api.collector.selector.OutputSelector;
 import org.apache.flink.streaming.api.datastream.ConnectedDataStream;
@@ -43,8 +48,11 @@ import org.apache.flink.streaming.api.datastream.IterativeDataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.datastream.SplitDataStream;
 import org.apache.flink.streaming.api.datastream.WindowedDataStream;
+import org.apache.flink.streaming.api.environment.LocalStreamEnvironment;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.WindowMapFunction;
+import org.apache.flink.streaming.api.functions.aggregation.AggregationFunction;
+import org.apache.flink.streaming.api.functions.aggregation.SumAggregator;
 import org.apache.flink.streaming.api.functions.co.CoFlatMapFunction;
 import org.apache.flink.streaming.api.functions.co.CoMapFunction;
 import org.apache.flink.streaming.api.functions.sink.SinkFunction;
@@ -54,7 +62,16 @@ import org.apache.flink.streaming.api.graph.StreamGraph.StreamLoop;
 import org.apache.flink.streaming.api.graph.StreamNode;
 import org.apache.flink.streaming.api.operators.AbstractUdfStreamOperator;
 import org.apache.flink.streaming.api.operators.StreamOperator;
+import org.apache.flink.streaming.api.operators.StreamProject;
+import org.apache.flink.streaming.api.windowing.deltafunction.DeltaFunction;
 import org.apache.flink.streaming.api.windowing.helper.Count;
+import org.apache.flink.streaming.api.windowing.helper.Delta;
+import org.apache.flink.streaming.api.windowing.helper.Time;
+import org.apache.flink.streaming.api.windowing.helper.Timestamp;
+import org.apache.flink.streaming.api.windowing.helper.WindowingHelper;
+import org.apache.flink.streaming.api.windowing.policy.CountTriggerPolicy;
+import org.apache.flink.streaming.api.windowing.policy.EvictionPolicy;
+import org.apache.flink.streaming.api.windowing.policy.TriggerPolicy;
 import org.apache.flink.streaming.runtime.partitioner.BroadcastPartitioner;
 import org.apache.flink.streaming.runtime.partitioner.FieldsPartitioner;
 import org.apache.flink.streaming.runtime.partitioner.GlobalPartitioner;
@@ -354,6 +371,7 @@ public class DataStreamTest {
 
 		DataStreamSource<Long> src = env.generateSequence(0, 0);
 
+		// map
 		MapFunction<Long, Integer> mapFunction = new MapFunction<Long, Integer>() {
 			@Override
 			public Integer map(Long value) throws Exception {
@@ -363,7 +381,7 @@ public class DataStreamTest {
 		DataStream<Integer> map = src.map(mapFunction);
 		assertEquals(mapFunction, getFunctionForDataStream(map));
 
-
+		// flatmap
 		FlatMapFunction<Long, Integer> flatMapFunction = new FlatMapFunction<Long, Integer>() {
 			@Override
 			public void flatMap(Long value, Collector<Integer> out) throws Exception {
@@ -372,6 +390,7 @@ public class DataStreamTest {
 		DataStream<Integer> flatMap = src.flatMap(flatMapFunction);
 		assertEquals(flatMapFunction, getFunctionForDataStream(flatMap));
 
+		// filter
 		FilterFunction<Integer> filterFunction = new FilterFunction<Integer>() {
 			@Override
 			public boolean filter(Integer value) throws Exception {
@@ -379,6 +398,7 @@ public class DataStreamTest {
 			}
 		};
 
+		// union
 		DataStream<Integer> unionFilter = map
 				.union(flatMap)
 				.filter(filterFunction);
@@ -397,6 +417,7 @@ public class DataStreamTest {
 			fail(e.getMessage());
 		}
 
+		// splitting
 		OutputSelector<Integer> outputSelector = new OutputSelector<Integer>() {
 			@Override
 			public Iterable<String> select(Integer value) {
@@ -415,6 +436,7 @@ public class DataStreamTest {
 		StreamEdge splitEdge = streamGraph.getStreamEdge(select.getId(), sink.getId());
 		assertEquals("a", splitEdge.getSelectedNames().get(0));
 
+		// fold
 		FoldFunction<Integer, String> foldFunction = new FoldFunction<Integer, String>() {
 			@Override
 			public String fold(String accumulator, Integer value) throws Exception {
@@ -424,6 +446,7 @@ public class DataStreamTest {
 		DataStream<String> fold = map.fold("", foldFunction);
 		assertEquals(foldFunction, getFunctionForDataStream(fold));
 
+		// coMap
 		ConnectedDataStream<String, Integer> connect = fold.connect(flatMap);
 		CoMapFunction<String, Integer, String> coMapper = new CoMapFunction<String, Integer, String>() {
 			@Override
@@ -450,6 +473,137 @@ public class DataStreamTest {
 		} catch (RuntimeException e) {
 			fail(e.getMessage());
 		}
+
+		// reduce
+		ReduceFunction<Integer> reduceFunction = new ReduceFunction<Integer>() {
+			@Override
+			public Integer reduce(Integer value1, Integer value2) throws Exception {
+				return null;
+			}
+		};
+		DataStream<Integer> reduce = map.reduce(reduceFunction);
+		assertEquals(reduceFunction, getFunctionForDataStream(reduce));
+
+		DataStream<Tuple3<Integer, Integer, Integer>> tuples = map.map(new MapFunction<Integer, Tuple3<Integer, Integer, Integer>>() {
+			@Override
+			public Tuple3<Integer, Integer, Integer> map(Integer value) throws Exception {
+				return null;
+			}
+		});
+
+		// project
+		int[] projectedFields = {0, 2};
+		DataStream<Tuple> project = tuples.project(projectedFields);
+		StreamProject projectOperator = (StreamProject)  getOperatorForDataStream(project);
+		assertArrayEquals(projectedFields, projectOperator.getFields());
+
+		tuples.sum(1);
+	}
+
+	@Test
+	public void testAggregations() {
+		StreamExecutionEnvironment env = new TestStreamEnvironment(PARALLELISM, MEMORYSIZE);
+
+		StreamGraph streamGraph = env.getStreamGraph();
+
+		DataStreamSource<Long> src = env.generateSequence(0, 0);
+		DataStreamSource<Tuple2<Integer, Integer>> tuples = env.fromElements(new Tuple2<Integer, Integer>(0, 2), new Tuple2<Integer, Integer>(0, 3));
+
+		// sum
+		DataStream<Tuple2<Integer, Integer>> sum = tuples.sum(1);
+		AggregationFunction<Tuple2<Integer, Integer>> sumAggregationFunction =
+				(AggregationFunction<Tuple2<Integer, Integer>>) getFunctionForDataStream(sum);
+		assertEquals(1, sumAggregationFunction.position);
+
+		// min
+		DataStream<Tuple2<Integer, Integer>> min = tuples.min(1);
+		AggregationFunction<Tuple2<Integer, Integer>> minAggregationFunction =
+				(AggregationFunction<Tuple2<Integer, Integer>>) getFunctionForDataStream(min);
+		assertEquals(1, minAggregationFunction.position);
+
+		// max
+		DataStream<Tuple2<Integer, Integer>> max = tuples.max(1);
+		AggregationFunction<Tuple2<Integer, Integer>> maxAggregationFunction =
+				(AggregationFunction<Tuple2<Integer, Integer>>) getFunctionForDataStream(max);
+		assertEquals(1, maxAggregationFunction.position);
+
+		max.print();
+
+		try {
+			env.execute();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+
+		Tuple2<Integer, Integer> tupleVal3 = new Tuple2<Integer, Integer>(-1, 3);
+		Tuple2<Integer, Integer> tupleVal2 = new Tuple2<Integer, Integer>(-1, 2);
+		try {
+			assertEquals(new Tuple2<Integer,Integer>(-1, 5), sumAggregationFunction.reduce(tupleVal2.copy(), tupleVal3.copy()));
+			assertEquals(new Tuple2<Integer,Integer>(-1, 2), minAggregationFunction.reduce(tupleVal2.copy(), tupleVal3.copy()));
+			assertEquals(new Tuple2<Integer,Integer>(-1, 3), maxAggregationFunction.reduce(tupleVal2.copy(), tupleVal3.copy()));
+		} catch (Exception e) {
+			fail(e.getMessage());
+		}
+	}
+
+	@Test
+	public void windowTest() {
+		StreamExecutionEnvironment env = new TestStreamEnvironment(PARALLELISM, MEMORYSIZE);
+
+		StreamGraph streamGraph = env.getStreamGraph();
+
+		DataStreamSource<Long> src = env.generateSequence(0, 0);
+		DataStreamSource<String> stringSrc = env.fromElements("a");
+
+		// TODO cross, join, window
+
+		Count count = Count.of(5);
+
+		DeltaFunction<Long> deltaFunction = new DeltaFunction<Long>() {
+			@Override
+			public double getDelta(Long oldDataPoint, Long newDataPoint) {
+				return 0;
+			}
+		};
+		Delta<Long> delta = Delta.of(0.1, deltaFunction, 0L);
+
+		Timestamp<Long> timestamp = new Timestamp<Long>() {
+			@Override
+			public long getTimestamp(Long value) {
+				return 0;
+			}
+		};
+		Time.of(3, timestamp, 0L);
+
+		WindowedDataStream<Long> window = src.window(count);
+
+		try {
+			WindowingHelper wh = new WindowingHelper() {
+				@Override
+				public EvictionPolicy toEvict() {
+					return null;
+				}
+
+				@Override
+				public TriggerPolicy toTrigger() {
+					return null;
+				}
+			};
+
+			Count c = Count.of(1);
+			Field triggerHelper = getField(WindowedDataStream.class, "triggerHelper");
+			triggerHelper.setAccessible(true);
+			System.out.println(triggerHelper.getType());
+			WindowingHelper triggerPolicy = (WindowingHelper<Long>) triggerHelper.get(c);
+
+			assertEquals(count.toTrigger(), triggerPolicy);
+		} catch (NoSuchFieldException e) {
+			fail(e.getMessage());
+		} catch (IllegalAccessException e) {
+			fail(e.getMessage());
+		}
+
+		System.out.println();
 	}
 
 	@Test
@@ -527,6 +681,19 @@ public class DataStreamTest {
 	/////////////////////////////////////////////////////////////
 	// Utilities
 	/////////////////////////////////////////////////////////////
+
+	private static Field getField(Class classOfObject, String field) throws NoSuchFieldException {
+		try {
+			return classOfObject.getDeclaredField(field);
+		} catch (NoSuchFieldException e) {
+			Class superClass = classOfObject.getSuperclass();
+			if (superClass == null) {
+				throw e;
+			} else {
+				return getField(superClass, field);
+			}
+		}
+	}
 
 	private static StreamOperator<?> getOperatorForDataStream(DataStream<?> dataStream) {
 		StreamExecutionEnvironment env = dataStream.getExecutionEnvironment();
