@@ -466,6 +466,27 @@ object SGD {
         }
       }
 
+      val userIDs = ratings.map(_.user).distinct()
+      val itemIDs = ratings.map(_.item).distinct()
+
+      val userCount = ratings.map {rating => (rating.user, 1)}.groupBy(0).sum(1)
+      val itemCount = ratings.map {rating => (rating.item, 1)}.groupBy(0).sum(1)
+
+      val initialUsers = generateRandomMatrix(userIDs, factors, seed)
+        .join(userCount).where(0).equalTo(0).map {row => (0, row._1, row._2._2)}
+
+      val initialItems = generateRandomMatrix(itemIDs, factors, seed)
+        .join(itemCount).where(0).equalTo(0).map {row => (1, row._1, row._2._2)}
+
+      val initUserItem = initialUsers.union(initialItems)
+      val userItem = initUserItem.iterate(iterations) {
+        item => updateFactors(1, item, factors, lambda, learningRate)
+      }
+
+      userItem.print()
+      println("----------------------------------------------------" +
+        "CHECKPOINT 01")
+
 /*      val blockIDPartitioner = new BlockIDPartitioner()
 
       val ratingsByUserBlock = ratings.map{
@@ -508,7 +529,7 @@ object SGD {
       }.withForwardedFields("0")*/
 
       // iteration to calculate the item matrix
-      val items = initialItems.iterate(iterations) {
+/*      val items = initialItems.iterate(iterations) {
         items => {
           val users = updateFactors(userBlocks, items, itemOut, userIn, factors, lambda,
             blockIDPartitioner)
@@ -519,7 +540,7 @@ object SGD {
       val pItems = persistencePath match {
         case Some(path) => FlinkMLTools.persist(items, path + "items")
         case None => items
-      }
+      }*/
 
       // perform last half-step to calculate the user matrix
 
@@ -532,29 +553,23 @@ object SGD {
   /** Calculates a single sweep for the SGD optimization. The result is the new value for
     * the user and item matrix.
     *
-    * @param numUserBlocks Number of blocks in the respective dimension
-    * @param items Fixed matrix value for the half step
-    * @param itemOut Out information to know where to send the vectors
-    * @param userIn In information for the cogroup step
+    * @param numBlocks Number of blocks in the respective dimension
+    * @param userItems Fixed matrix value for the half step
     * @param factors Number of latent factors
     * @param lambda Regularization constant
     * @param learningRate Learning rate
-    * @param blockIDPartitioner Custom Flink partitioner
     * @return New value for the optimized matrix (either user or item)
     */
-  def updateFactors(items: DataSet[(Int, Array[Array[Double]])],
-                    itemOut: DataSet[(Int, OutBlockInformation)],
-                    userIn: DataSet[(Int, InBlockInformation)],
+  def updateFactors(numBlocks: Int,
+                    userItems: DataSet[(Int, Factors, Int)],
                     factors: Int,
                     lambda: Double,
-                    learningRate: Double,
-                    blockIDPartitioner: FlinkPartitioner[Int]):
-  DataSet[(Int, Array[Array[Double]])] = {
-    // send the item vectors to the blocks whose users have rated the items
+                    learningRate: Double):
+  DataSet[(Int, Factors, Int)] = {
 
-
-//    }.withForwardedFieldsFirst("0").withForwardedFieldsSecond("0")
+    userItems
   }
+
 /*
 
   /** Creates the meta information needed to route the item and user vectors to the respective user
@@ -873,10 +888,11 @@ object SGD {
       row += 1
     }
   }
+  */
 
-  def generateRandomMatrix(users: DataSet[Int], factors: Int, seed: Long): DataSet[Factors] = {
-    users map {
-      id =>{
+  def generateRandomMatrix(ids: DataSet[Int], factors: Int, seed: Long): DataSet[Factors] = {
+    ids map {
+      id => {
         val random = new Random(id ^ seed)
         Factors(id, randomFactors(factors, random))
       }
@@ -885,5 +901,5 @@ object SGD {
 
   def randomFactors(factors: Int, random: Random): Array[Double] = {
     Array.fill(factors)(random.nextDouble())
-  }*/
+  }
 }
