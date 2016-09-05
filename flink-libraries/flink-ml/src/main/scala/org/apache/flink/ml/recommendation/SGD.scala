@@ -479,6 +479,8 @@ object SGD {
         .join(itemCount).where(0).equalTo(0).map {row => (1, row._1, row._2._2)}
 
       val initUserItem = initialUsers.union(initialItems)
+
+
       val userItem = initUserItem.iterate(iterations) {
         item => updateFactors(1, item, factors, lambda, learningRate)
       }
@@ -566,6 +568,19 @@ object SGD {
                     lambda: Double,
                     learningRate: Double):
   DataSet[(Int, Factors, Int)] = {
+    val rand = Random
+    val users = userItems.filter(_._1 == 0)
+      .map {row => (row, rand.nextInt(numBlocks))}
+
+    val items = userItems.filter(_._1 == 0)
+      .map {row => (row, rand.nextInt(numBlocks))}
+
+    val i = 1
+    val grouped = users.coGroup(items).where(1).equalTo(elem => (elem._2 + numBlocks - i) % numBlocks)
+    val groupedWithRatings = grouped reduce { (userArray, itemArray) => {
+      (userArray, itemArray)
+      }
+    }
 
     userItems
   }
