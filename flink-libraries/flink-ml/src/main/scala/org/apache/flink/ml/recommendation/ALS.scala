@@ -683,17 +683,18 @@ object ALS {
               var i = 0
               while (i < users.length) {
                 numRatings(users(i)) += 1
-                // Extension to the original paper to handle negative observations.
-                // Confidence is a function of absolute value of the observation
-                // instead so that it is never negative. c1 is confidence - 1.0.
-                //val c1 = alpha * math.abs(ratings(i))
-                if(ratings(i)>0) {
-                  val c1 = alpha * ratings(i)
-                  blas.daxpy(matrix.length, c1, matrix, 1, userXtX(users(i)), 1)
-                  //userXtX(users(i))(users(i)) += userXtX(users(i))(users(i))*c1
-                  //blas.daxpy(matrix.length, c1, matrix, 1, userXtX(users(i)), 1)
-                  blas.daxpy(vector.length, c1 + 1.0, vector, 1, userXy(users(i)), 1)
-
+                if (implicitPrefs) {
+                  // Extension to the original paper to handle negative observations.
+                  // Confidence is a function of absolute value of the observation
+                  // instead so that it is never negative. c1 is confidence - 1.0.
+                  //val c1 = alpha * math.abs(ratings(i))
+                  if (ratings(i) > 0) {
+                    val c1 = alpha * ratings(i)
+                    blas.daxpy(matrix.length, c1, matrix, 1, userXtX(users(i)), 1)
+                    //userXtX(users(i))(users(i)) += userXtX(users(i))(users(i))*c1
+                    //blas.daxpy(matrix.length, c1, matrix, 1, userXtX(users(i)), 1)
+                    blas.daxpy(vector.length, c1 + 1.0, vector, 1, userXy(users(i)), 1)
+                  }
               } else {
                 blas.daxpy(matrix.length, 1, matrix, 1, userXtX(users(i)), 1)
                 blas.daxpy(vector.length, ratings(i), vector, 1, userXy(users(i)), 1)
