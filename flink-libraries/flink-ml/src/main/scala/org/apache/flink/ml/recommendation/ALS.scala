@@ -579,7 +579,9 @@ object ALS {
     lambda: Double, blockIDPartitioner: FlinkPartitioner[Int],
     implicitPrefs: Boolean, alpha: Double):
   DataSet[(Int, Array[Array[Double]])] = {
-    val YtY = if(implicitPrefs) Some(computeYtY(items, factors)) else None
+//    val YtY = if(implicitPrefs) Some(computeYtY(items, factors)) else None
+    // mock to compile
+    val YtY: Option[Array[Double]] = None
 
     // send the item vectors to the blocks whose users have rated the items
     val partialBlockMsgs = itemOut.join(items).where(0).equalTo(0).
@@ -741,35 +743,16 @@ object ALS {
   }
 
   /**
-    * Computes the YtY matrix for the implicit version before updating the factors
+    * Computes the YtY matrix for the implicit version before updating the factors.
+    * This matrix is intended to be broadcast, but as we cannot use a sink inside a Flink
+    * iteration, so we represent it as a [[DataSet]] with a single element containing the matrix.
+    *
+    * The algorithm computes `Y_i^T * Y_i` for every block `Y_i` of `Y`,
+    * then sums all these computed matrices to get `Y^T * Y`.
     */
-  def computeYtY(items: DataSet[(Int, Array[Array[Double]])], factors: Int): Array[Double]={
-    val triangleSize = (factors*factors - factors)/2 + factors
-    val YtY = Array.fill(triangleSize)(0.0)
-    val env = ExecutionEnvironment.getExecutionEnvironment
-    val YtYd = env.fromElements(YtY)
-    //    items.collect().foreach{
-    //      item => item._2.foreach{
-    //        x => blas.dspr("U", x.length, 1, x, 1, YtY)
-    //      }
-    //    }
-    //    items.reduceGroup {
-    //      (x,y) => {
-    //        x.map(a => a._2).foreach(a => a.foreach(b => blas.dspr("U", b.length, 1, b, 1, YtY)))
-    //      }
-    //    }
-    items.mapWithBcVariable(YtYd) {
-      (x, ytY) => {
-        x._2.foreach(b => blas.dspr("U", b.length, 1, b, 1, ytY))
-      }
-    }
-    //    items.map {
-    //      x => {
-    //        x._2.foreach(b => blas.dspr("U", b.length, 1, b, 1, YtY))
-    //      }
-    //    }
-
-    YtY
+  def computeYtY(items: DataSet[(Int, Array[Array[Double]])], factors: Int): DataSet[Array[Double]] = {
+    // mock result to compile
+    items.map(_._2.head)
   }
 
   /** Creates the meta information needed to route the item and user vectors to the respective user
