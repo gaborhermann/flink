@@ -751,8 +751,26 @@ object ALS {
     * then sums all these computed matrices to get `Y^T * Y`.
     */
   def computeYtY(items: DataSet[(Int, Array[Array[Double]])], factors: Int): DataSet[Array[Double]] = {
-    // mock result to compile
-    items.map(_._2.head)
+    val triangleSize = factors * (factors - 1) / 2 + factors
+
+    // construct YtY for all blocks
+    val yty = items
+      .map(b => {
+        // computing YtY for one block
+        var ytyForBlock = Array.fill(triangleSize)(0.0)
+        val yBlock = b._2
+
+        yBlock.foreach(row => blas.dspr("U", row.length, 1, row, 1, ytyForBlock))
+
+        ytyForBlock
+      })
+      .reduce((byty1: Array[Double], byty2: Array[Double]) => {
+        // adding the YtYs computed for blocks
+        blas.daxpy(byty1.length, 1, byty1, 1, byty2, 1)
+        byty2
+      })
+
+    yty
   }
 
   /** Creates the meta information needed to route the item and user vectors to the respective user

@@ -63,8 +63,9 @@ class ImplicitALSTest
 
     // check YtY size
     YtY.length should be (factors * (factors - 1) / 2 + factors)
+
     // check result is as expected
-    toUpperTriangle(expectedYtY)
+    expectedUpperTriangleYtY
       .zip(YtY)
       .foreach { case (expected, result) =>
         result should be (expected +- 0.1)
@@ -92,15 +93,13 @@ object ExampleMatrix {
     Array(20.0, 5.0, 32.0)
   )
 
-  // todo cleanup
-  def toUpperTriangle(m: Array[Array[Double]]) = {
-    val n = m.length
-
-    m.zipWithIndex
-      .map { case (row, i) =>
-        row.toList.drop(i).toArray
-      }
-      .reduce((r1, r2) => (r1.toList ++ r2.toList).toArray)
-  }
+  /**
+    * Upper triangle representation by columns.
+    */
+  val expectedUpperTriangleYtY = Array(
+    37.0,
+    -10.0, 35.0,
+    20.0, 5.0, 32.0
+  )
 
 }
