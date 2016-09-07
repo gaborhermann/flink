@@ -18,21 +18,22 @@
 
 package org.apache.flink.ml.recommendation
 
-import java.{util, lang}
+import java.{lang, util}
 
 import org.apache.flink.api.common.operators.base.JoinOperatorBase.JoinHint
 import org.apache.flink.api.scala._
 import org.apache.flink.api.common.operators.Order
-import org.apache.flink.core.memory.{DataOutputView, DataInputView}
+import org.apache.flink.core.memory.{DataInputView, DataOutputView}
 import org.apache.flink.ml.common._
 import org.apache.flink.ml.pipeline.{FitOperation, PredictDataSetOperation, Predictor}
 import org.apache.flink.types.Value
 import org.apache.flink.util.Collector
-import org.apache.flink.api.common.functions.{Partitioner => FlinkPartitioner, GroupReduceFunction, CoGroupFunction}
+import org.apache.flink.api.common.functions.{GroupReduceFunction, CoGroupFunction,
+RichCoGroupFunction, Partitioner => FlinkPartitioner}
 import org.apache.flink.ml._
-
 import com.github.fommil.netlib.BLAS.{ getInstance => blas }
 import com.github.fommil.netlib.LAPACK.{ getInstance => lapack }
+import org.apache.flink.configuration.Configuration
 import org.netlib.util.intW
 
 import scala.collection.mutable
@@ -579,9 +580,7 @@ object ALS {
     lambda: Double, blockIDPartitioner: FlinkPartitioner[Int],
     implicitPrefs: Boolean, alpha: Double):
   DataSet[(Int, Array[Array[Double]])] = {
-//    val YtY = if(implicitPrefs) Some(computeYtY(items, factors)) else None
-    // mock to compile
-    val YtY: Option[Array[Double]] = None
+    val YtYtoBroadcast = if(implicitPrefs) Some(computeYtY(items, factors)) else None
 
     // send the item vectors to the blocks whose users have rated the items
     val partialBlockMsgs = itemOut.join(items).where(0).equalTo(0).
@@ -614,9 +613,9 @@ object ALS {
     }
 
     // collect the partial update messages and calculate for each user block the new user vectors
-    partialBlockMsgs.coGroup(userIn).where(0).equalTo(0).sortFirstGroup(1, Order.ASCENDING).
+    val newMatrix = partialBlockMsgs.coGroup(userIn).where(0).equalTo(0).sortFirstGroup(1, Order.ASCENDING).
       withPartitioner(blockIDPartitioner).apply{
-      new CoGroupFunction[(Int, Int, Array[Array[Double]]), (Int,
+      new RichCoGroupFunction[(Int, Int, Array[Array[Double]]), (Int,
         InBlockInformation), (Int, Array[Array[Double]])](){
 
         // in order to save space, store only the upper triangle of the XtX matrix
@@ -626,6 +625,15 @@ object ALS {
         val userXtX = new ArrayBuffer[Array[Double]]()
         val userXy = new ArrayBuffer[Array[Double]]()
         val numRatings = new ArrayBuffer[Int]()
+
+        var YtY: Array[Double] = null
+
+        override def open(config: Configuration): Unit = {
+          // retrieve broadcasted precomputed YtY if using implicit feedback
+          if (implicitPrefs) {
+            YtY = getRuntimeContext.getBroadcastVariable[Array[Double]]("YtY").iterator().next()
+          }
+        }
 
         override def coGroup(left: lang.Iterable[(Int, Int, Array[Array[Double]])],
           right: lang.Iterable[(Int, InBlockInformation)],
@@ -728,7 +736,7 @@ object ALS {
             val result = new intW(0)
             if(implicitPrefs) {
 //              blas.daxpy(fullMatrix.length, 1.0, YtY.get, 1, fullMatrix, 1)
-              blas.daxpy(YtY.get.length, 1.0, YtY.get, 1, fullMatrix, 1)
+              blas.daxpy(YtY.length, 1.0, YtY, 1, fullMatrix, 1)
             }
             lapack.dposv("U", factors, 1, fullMatrix, factors , userXy(i), factors, result)
             array(i) = userXy(i)
@@ -739,7 +747,15 @@ object ALS {
           collector.collect((blockID, array))
         }
       }
-    }.withForwardedFieldsFirst("0").withForwardedFieldsSecond("0")
+    }
+
+    val updatedFactorMatrix = if (implicitPrefs) {
+      newMatrix.withBroadcastSet(YtYtoBroadcast.get, "YtY")
+    } else {
+      newMatrix
+    }
+
+    updatedFactorMatrix.withForwardedFieldsFirst("0").withForwardedFieldsSecond("0")
   }
 
   /**
