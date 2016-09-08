@@ -580,7 +580,7 @@ object ALS {
     lambda: Double, blockIDPartitioner: FlinkPartitioner[Int],
     implicitPrefs: Boolean, alpha: Double):
   DataSet[(Int, Array[Array[Double]])] = {
-    val YtYtoBroadcast = if(implicitPrefs) Some(computeYtY(items, factors)) else None
+    val XtXtoBroadcast = if (implicitPrefs) Some(computeXtX(items, factors)) else None
 
     // send the item vectors to the blocks whose users have rated the items
     val partialBlockMsgs = itemOut.join(items).where(0).equalTo(0).
@@ -613,7 +613,8 @@ object ALS {
     }
 
     // collect the partial update messages and calculate for each user block the new user vectors
-    val newMatrix = partialBlockMsgs.coGroup(userIn).where(0).equalTo(0).sortFirstGroup(1, Order.ASCENDING).
+    val newMatrix =
+    partialBlockMsgs.coGroup(userIn).where(0).equalTo(0).sortFirstGroup(1, Order.ASCENDING).
       withPartitioner(blockIDPartitioner).apply{
       new RichCoGroupFunction[(Int, Int, Array[Array[Double]]), (Int,
         InBlockInformation), (Int, Array[Array[Double]])](){
@@ -626,12 +627,12 @@ object ALS {
         val userXy = new ArrayBuffer[Array[Double]]()
         val numRatings = new ArrayBuffer[Int]()
 
-        var YtY: Array[Double] = null
+        var precomputedXtX: Array[Double] = null
 
         override def open(config: Configuration): Unit = {
-          // retrieve broadcasted precomputed YtY if using implicit feedback
+          // retrieve broadcasted precomputed XtX if using implicit feedback
           if (implicitPrefs) {
-            YtY = getRuntimeContext.getBroadcastVariable[Array[Double]]("YtY").iterator().next()
+            precomputedXtX = getRuntimeContext.getBroadcastVariable[Array[Double]]("XtX").iterator().next()
           }
         }
 
@@ -692,23 +693,22 @@ object ALS {
 
               var i = 0
               while (i < users.length) {
-                numRatings(users(i)) += 1
                 if (implicitPrefs) {
                   // Extension to the original paper to handle negative observations.
                   // Confidence is a function of absolute value of the observation
                   // instead so that it is never negative. c1 is confidence - 1.0.
                   //val c1 = alpha * math.abs(ratings(i))
                   if (ratings(i) > 0) {
+                    numRatings(users(i)) += 1
                     val c1 = alpha * ratings(i)
                     blas.daxpy(matrix.length, c1, matrix, 1, userXtX(users(i)), 1)
-                    //userXtX(users(i))(users(i)) += userXtX(users(i))(users(i))*c1
-                    //blas.daxpy(matrix.length, c1, matrix, 1, userXtX(users(i)), 1)
                     blas.daxpy(vector.length, c1 + 1.0, vector, 1, userXy(users(i)), 1)
                   }
-              } else {
-                blas.daxpy(matrix.length, 1, matrix, 1, userXtX(users(i)), 1)
-                blas.daxpy(vector.length, ratings(i), vector, 1, userXy(users(i)), 1)
-              }
+                } else {
+                  numRatings(users(i)) += 1
+                  blas.daxpy(matrix.length, 1, matrix, 1, userXtX(users(i)), 1)
+                  blas.daxpy(vector.length, ratings(i), vector, 1, userXy(users(i)), 1)
+                }
 
                 i += 1
               }
@@ -722,6 +722,11 @@ object ALS {
 
           i = 0
           while(i < numUsers){
+            // adding implicit matrix to vectors
+            if (implicitPrefs) {
+              blas.daxpy(precomputedXtX.length, 1.0, precomputedXtX, 1, userXtX(i), 1)
+            }
+
             generateFullMatrix(userXtX(i), fullMatrix, factors)
 
             var f = 0
@@ -734,10 +739,6 @@ object ALS {
 
             // calculate new user vector
             val result = new intW(0)
-            if(implicitPrefs) {
-//              blas.daxpy(fullMatrix.length, 1.0, YtY.get, 1, fullMatrix, 1)
-              blas.daxpy(YtY.length, 1.0, YtY, 1, fullMatrix, 1)
-            }
             lapack.dposv("U", factors, 1, fullMatrix, factors , userXy(i), factors, result)
             array(i) = userXy(i)
 
@@ -750,7 +751,7 @@ object ALS {
     }
 
     val updatedFactorMatrix = if (implicitPrefs) {
-      newMatrix.withBroadcastSet(YtYtoBroadcast.get, "YtY")
+      newMatrix.withBroadcastSet(XtXtoBroadcast.get, "XtX")
     } else {
       newMatrix
     }
@@ -759,34 +760,37 @@ object ALS {
   }
 
   /**
-    * Computes the YtY matrix for the implicit version before updating the factors.
+    * Computes the XtX matrix for the implicit version before updating the factors.
     * This matrix is intended to be broadcast, but as we cannot use a sink inside a Flink
     * iteration, so we represent it as a [[DataSet]] with a single element containing the matrix.
     *
-    * The algorithm computes `Y_i^T * Y_i` for every block `Y_i` of `Y`,
-    * then sums all these computed matrices to get `Y^T * Y`.
+    * The algorithm computes `X_i^T * X_i` for every block `X_i` of `X`,
+    * then sums all these computed matrices to get `X^T * X`.
     */
-  def computeYtY(items: DataSet[(Int, Array[Array[Double]])], factors: Int): DataSet[Array[Double]] = {
+  def computeXtX(x: DataSet[(Int, Array[Array[Double]])], factors: Int):
+  DataSet[Array[Double]] = {
     val triangleSize = factors * (factors - 1) / 2 + factors
 
-    // construct YtY for all blocks
-    val yty = items
+    // construct XtX for all blocks
+    val xtx = x
       .map(b => {
-        // computing YtY for one block
-        var ytyForBlock = Array.fill(triangleSize)(0.0)
-        val yBlock = b._2
+        // computing XtX for one block
+        var xtxForBlock = Array.fill(triangleSize)(0.0)
+        val xBlock = b._2
 
-        yBlock.foreach(row => blas.dspr("U", row.length, 1, row, 1, ytyForBlock))
+        xBlock.foreach(row => blas.dspr("U", row.length, 1, row, 1, xtxForBlock))
 
-        ytyForBlock
+        xtxForBlock
       })
-      .reduce((byty1: Array[Double], byty2: Array[Double]) => {
-        // adding the YtYs computed for blocks
-        blas.daxpy(byty1.length, 1, byty1, 1, byty2, 1)
-        byty2
+      .reduce((bxtx1: Array[Double], bxtx2: Array[Double]) => {
+        // adding the XtXs computed for blocks
+        var addedXtX = Array.fill(triangleSize)(0.0)
+        blas.daxpy(bxtx1.length, 1, bxtx1, 1, addedXtX, 1)
+        blas.daxpy(bxtx2.length, 1, bxtx2, 1, addedXtX, 1)
+        addedXtX
       })
 
-    yty
+    xtx
   }
 
   /** Creates the meta information needed to route the item and user vectors to the respective user

@@ -58,7 +58,7 @@ class ImplicitALSTest
     val distribBlocksY = env.fromCollection(blocksY)
 
     val YtY = ALS
-      .computeYtY(distribBlocksY, factors)
+      .computeXtX(distribBlocksY, factors)
       .collect().head
 
     // check YtY size
