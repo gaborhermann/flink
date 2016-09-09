@@ -137,6 +137,10 @@ class ALS extends Predictor[ALS] {
   // Stores the matrix factorization after the fitting phase
   var factorsOption: Option[(DataSet[Factors], DataSet[Factors])] = None
 
+  // get user and item factors if ALS is trained
+  def userFactors: Option[DataSet[Factors]] = factorsOption.map(_._1)
+  def itemFactors: Option[DataSet[Factors]] = factorsOption.map(_._2)
+
   /** Sets the number of latent factors/row dimension of the latent model
     *
     * @param numFactors
@@ -632,7 +636,8 @@ object ALS {
         override def open(config: Configuration): Unit = {
           // retrieve broadcasted precomputed XtX if using implicit feedback
           if (implicitPrefs) {
-            precomputedXtX = getRuntimeContext.getBroadcastVariable[Array[Double]]("XtX").iterator().next()
+            precomputedXtX = getRuntimeContext.getBroadcastVariable[Array[Double]]("XtX")
+              .iterator().next()
           }
         }
 
@@ -784,10 +789,8 @@ object ALS {
       })
       .reduce((bxtx1: Array[Double], bxtx2: Array[Double]) => {
         // adding the XtXs computed for blocks
-        var addedXtX = Array.fill(triangleSize)(0.0)
-        blas.daxpy(bxtx1.length, 1, bxtx1, 1, addedXtX, 1)
-        blas.daxpy(bxtx2.length, 1, bxtx2, 1, addedXtX, 1)
-        addedXtX
+        blas.daxpy(bxtx1.length, 1, bxtx1, 1, bxtx2, 1)
+        bxtx2
       })
 
     xtx
