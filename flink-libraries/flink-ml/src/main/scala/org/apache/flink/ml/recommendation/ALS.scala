@@ -768,10 +768,36 @@ object ALS {
     updatedFactorMatrix.withForwardedFieldsFirst("0").withForwardedFieldsSecond("0")
   }
 
+  /**
+    * Computes the XtX matrix for the implicit version before updating the factors.
+    * This matrix is intended to be broadcast, but as we cannot use a sink inside a Flink
+    * iteration, so we represent it as a [[DataSet]] with a single element containing the matrix.
+    *
+    * The algorithm computes `X_i^T * X_i` for every block `X_i` of `X`,
+    * then sums all these computed matrices to get `X^T * X`.
+    */
   def computeXtX(x: DataSet[(Int, Array[Array[Double]])], factors: Int):
   DataSet[Array[Double]] = {
-    // todo compute XtX
-    null
+    val triangleSize = factors * (factors - 1) / 2 + factors
+
+    // construct XtX for all blocks
+    val xtx = x
+      .map(b => {
+        // computing XtX for one block
+        var xtxForBlock = Array.fill(triangleSize)(0.0)
+        val xBlock = b._2
+
+        xBlock.foreach(row => blas.dspr("U", row.length, 1, row, 1, xtxForBlock))
+
+        xtxForBlock
+      })
+      .reduce((bxtx1: Array[Double], bxtx2: Array[Double]) => {
+        // aggregating the XtXs computed for blocks
+        blas.daxpy(bxtx1.length, 1, bxtx1, 1, bxtx2, 1)
+        bxtx2
+      })
+
+    xtx
   }
 
   /** Creates the meta information needed to route the item and user vectors to the respective user
