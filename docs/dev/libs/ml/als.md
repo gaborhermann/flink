@@ -49,6 +49,18 @@ By applying this step alternately to the matrices $U$ and $V$, we can iterativel
 
 The matrix $R$ is given in its sparse representation as a tuple of $(i, j, r)$ where $i$ denotes the row index, $j$ the column index and $r$ is the matrix value at position $(i,j)$.
 
+An alternative model can be used for _implicit feedback_ datasets.
+These datasets only contain implicit feedback from the user
+in constrast to datasets with explicit feedback like movie ratings.
+For example users watch videos on a website and the website monitors which user
+viewed which video, so the users only provide their preference implicitly.
+In these cases the feedback should not be treated as a
+rating, but rather an evidence that the user prefers that item.
+Thus, for implicit feedback datasets there is a slightly different
+minimalization problem to solve (see [Hu et al.] for details).
+Flink supports both explicit and implicit ALS,
+and the choice between the two can be set in the parameters.
+
 ## Operations
 
 `ALS` is a `Predictor`.
