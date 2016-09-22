@@ -779,7 +779,7 @@ object ALS {
     * The algorithm computes `X_i^T * X_i` for every block `X_i` of `X`,
     * then sums all these computed matrices to get `X^T * X`.
     */
-  def computeXtX(x: DataSet[(Int, Array[Array[Double]])], factors: Int):
+  private[recommendation] def computeXtX(x: DataSet[(Int, Array[Array[Double]])], factors: Int):
   DataSet[Array[Double]] = {
     val triangleSize = factors * (factors - 1) / 2 + factors
 
