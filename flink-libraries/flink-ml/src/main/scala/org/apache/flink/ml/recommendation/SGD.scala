@@ -31,6 +31,7 @@ import org.apache.flink.util.Collector
 import org.apache.flink.api.common.functions.{CoGroupFunction, GroupReduceFunction, Partitioner => FlinkPartitioner}
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
 import com.github.fommil.netlib.LAPACK.{getInstance => lapack}
+import org.apache.flink.core.fs.FileSystem
 import org.apache.flink.ml.recommendation.SGD.LearningRate
 import org.netlib.util.intW
 
@@ -311,87 +312,13 @@ object SGD {
     *
     * @param id
     * @param factors
+    * @param omega
     */
-  case class Factors(id: Int, factors: Array[Double]) {
-    override def toString = s"($id, ${factors.mkString(",")})"
+  case class Factors(id: Int, isUser: Boolean, factors: Array[Double], omega: Int) extends Serializable{
+    override def toString = s"(id:$id,isUser:$isUser,omega:$omega,array:${factors.map(d => f"$d%1.2f").mkString(",")})"
   }
 
   case class Factorization(userFactors: DataSet[Factors], itemFactors: DataSet[Factors])
-
- /* case class OutBlockInformation(elementIDs: Array[Int], outLinks: OutLinks) {
-    override def toString: String = {
-      s"OutBlockInformation:((${elementIDs.mkString(",")}), ($outLinks))"
-    }
-  }
-
-  class OutLinks(var links: Array[scala.collection.mutable.BitSet]) extends Value {
-    def this() = this(null)
-
-    override def toString: String = {
-      s"${links.mkString("\n")}"
-    }
-
-    override def write(out: DataOutputView): Unit = {
-      out.writeInt(links.length)
-      links foreach {
-        link => {
-          val bitMask = link.toBitMask
-          out.writeInt(bitMask.length)
-          for (element <- bitMask) {
-            out.writeLong(element)
-          }
-        }
-      }
-    }
-
-    override def read(in: DataInputView): Unit = {
-      val length = in.readInt()
-      links = new Array[scala.collection.mutable.BitSet](length)
-
-      for (i <- 0 until length) {
-        val bitMaskLength = in.readInt()
-        val bitMask = new Array[Long](bitMaskLength)
-        for (j <- 0 until bitMaskLength) {
-          bitMask(j) = in.readLong()
-        }
-        links(i) = mutable.BitSet.fromBitMask(bitMask)
-      }
-    }
-
-    def apply(idx: Int) = links(idx)
-  }
-
-  case class InBlockInformation(elementIDs: Array[Int], ratingsForBlock: Array[BlockRating]) {
-
-    override def toString: String = {
-      s"InBlockInformation:((${elementIDs.mkString(",")}), (${ratingsForBlock.mkString("\n")}))"
-    }
-  }
-
-  case class BlockRating(var ratings: Array[(Array[Int], Array[Double])]) {
-    def apply(idx: Int) = ratings(idx)
-
-    override def toString: String = {
-      ratings.map {
-        case (left, right) => s"((${left.mkString(",")}),(${right.mkString(",")}))"
-      }.mkString(",")
-    }
-  }
-
-  case class BlockedFactorization(userFactors: DataSet[(Int, Array[Array[Double]])],
-                                  itemFactors: DataSet[(Int, Array[Array[Double]])])
-
-  class BlockIDPartitioner extends FlinkPartitioner[Int] {
-    override def partition(blockID: Int, numberOfPartitions: Int): Int = {
-      blockID % numberOfPartitions
-    }
-  }
-
-  class BlockIDGenerator(blocks: Int) extends Serializable {
-    def apply(id: Int): Int = {
-      id % blocks
-    }
-  }*/
 
   // ================================= Factory methods =============================================
 
@@ -408,6 +335,16 @@ object SGD {
                                  predictParameters: ParameterMap,
                                  input: DataSet[(Int, Int)])
     : DataSet[(Int, Int, Double)] = {
+
+/*      instance.factorsOption.foreach(i => {
+        val bp1 = 0
+        println("before")
+        i._1.print()
+        println("after")
+        val bp2 = 0
+        i._2.print()
+        val bp3 = 0
+      })*/
 
       instance.factorsOption match {
         case Some((userFactors, itemFactors)) => {
@@ -450,8 +387,7 @@ object SGD {
     : Unit = {
       val resultParameters = instance.parameters ++ fitParameters
 
-      val userBlocks = resultParameters.get(Blocks).getOrElse(input.count.toInt)
-      val itemBlocks = userBlocks
+      val numBlocks = resultParameters.get(Blocks).getOrElse(1)
       val persistencePath = resultParameters.get(TemporaryPath)
       val seed = resultParameters(Seed)
       val factors = resultParameters(NumFactors)
@@ -469,86 +405,168 @@ object SGD {
       val userIDs = ratings.map(_.user).distinct()
       val itemIDs = ratings.map(_.item).distinct()
 
+      val userGroups = userIDs.map(id => (id, Random.nextInt(numBlocks)))
+
+      val itemGroups = itemIDs.map(id => (id, Random.nextInt(numBlocks)))
+
       val userCount = ratings.map {rating => (rating.user, 1)}.groupBy(0).sum(1)
       val itemCount = ratings.map {rating => (rating.item, 1)}.groupBy(0).sum(1)
 
-      val initialUsers = generateRandomMatrix(userIDs, factors, seed)
-        .join(userCount).where(0).equalTo(0).map {row => (0, row._1, row._2._2)}
+      val ratingsGrouped = ratings.join(userGroups).where(_.user).equalTo(0).join(itemGroups).where(_._1.item).equalTo(0)
+        .map(i => (i._1._1, i._1._2._2 * numBlocks + i._2._2))
+        .groupBy(1).reduceGroup {
+          ratings => {
+            val seq = ratings.toSeq
+            val rating = seq.map(elem => elem._1)
+            val group = seq(0)._2
 
-      val initialItems = generateRandomMatrix(itemIDs, factors, seed)
-        .join(itemCount).where(0).equalTo(0).map {row => (1, row._1, row._2._2)}
+            (group, rating)
+          }
+        }
 
-      val initUserItem = initialUsers.union(initialItems)
+      val initialUsers = userGroups
+        .join(userCount).where(0).equalTo(0)
+        .map(row => (row._1._2, new Factors(row._1._1, true,  Array.fill(factors)(Random.nextDouble()), row._2._2)))
+        .groupBy(0).reduceGroup {
+        users => {
+          val seq = users.toSeq
+          val factors = seq.map(elem => elem._2)
+          val group = seq(0)._1 * (numBlocks + 1)
 
-
-      val userItem = initUserItem.iterate(iterations) {
-        item => updateFactors(1, item, factors, lambda, learningRate)
-      }
-
-      userItem.print()
-      println("----------------------------------------------------" +
-        "CHECKPOINT 01")
-
-/*      val blockIDPartitioner = new BlockIDPartitioner()
-
-      val ratingsByUserBlock = ratings.map{
-        rating =>
-          val blockID = rating.user % userBlocks
-          (blockID, rating)
-      } partitionCustom(blockIDPartitioner, 0)
-
-      val ratingsByItemBlock = ratings map {
-        rating =>
-          val blockID = rating.item % itemBlocks
-          (blockID, new Rating(rating.item, rating.user, rating.rating))
-      } partitionCustom(blockIDPartitioner, 0)
-
-      val (uIn, uOut) = createBlockInformation(userBlocks, itemBlocks, ratingsByUserBlock,
-        blockIDPartitioner)
-      val (iIn, iOut) = createBlockInformation(itemBlocks, userBlocks, ratingsByItemBlock,
-        blockIDPartitioner)
-
-      val (userIn, userOut) = persistencePath match {
-        case Some(path) => FlinkMLTools.persist(uIn, uOut, path + "userIn", path + "userOut")
-        case None => (uIn, uOut)
-      }
-
-      val (itemIn, itemOut) = persistencePath match {
-        case Some(path) => FlinkMLTools.persist(iIn, iOut, path + "itemIn", path + "itemOut")
-        case None => (iIn, iOut)
-      }
-
-      val initialItems = itemOut.partitionCustom(blockIDPartitioner, 0).map{
-        outInfos =>
-          val blockID = outInfos._1
-          val infos = outInfos._2
-
-          (blockID, infos.elementIDs.map{
-            id =>
-              val random = new Random(id ^ seed)
-              randomFactors(factors, random)
-          })
-      }.withForwardedFields("0")*/
-
-      // iteration to calculate the item matrix
-/*      val items = initialItems.iterate(iterations) {
-        items => {
-          val users = updateFactors(userBlocks, items, itemOut, userIn, factors, lambda,
-            blockIDPartitioner)
-          updateFactors(itemBlocks, users, userOut, itemIn, factors, lambda, blockIDPartitioner)
+          (group, factors)
         }
       }
 
-      val pItems = persistencePath match {
-        case Some(path) => FlinkMLTools.persist(items, path + "items")
-        case None => items
+      val initialItems = itemGroups
+        .join(itemCount).where(0).equalTo(0)
+        .map(row => (row._1._2, new Factors(row._1._1, false, Array.fill(factors)(Random.nextDouble()), row._2._2)))
+        .groupBy(0).reduceGroup {
+        items => {
+          val seq = items.toSeq
+          val factors = seq.map(elem => elem._2)
+          val group = seq(0)._1  * (numBlocks + 1)
+
+          (group, factors)
+        }
+      }
+
+      val initUserItem = initialUsers.union(initialItems)
+
+/*
+      // FOR DEBUGGING
+      initUserItem.writeAsCsv("/home/dani/data/tmp/initUserItem.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+      val elem = initUserItem
+      val users1 = elem.filter(i => i._2(0).isUser)
+      val items1 = elem.filter(i => !i._2(0).isUser)
+
+      users1.writeAsCsv("/home/dani/data/tmp/users1.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+      items1.writeAsCsv("/home/dani/data/tmp/items1.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+
+      val grouped01 = users1.join(items1).where(0).equalTo(0) {
+        (user, item, out: Collector[(Int, Seq[SGD.Factors], Seq[SGD.Factors])]) =>
+          out.collect(user._1, user._2, item._2)
+      }.join(ratingsGrouped).where(0).equalTo(0) {
+        (userItem, rating, out: Collector[(Int, Seq[SGD.Factors], Seq[SGD.Factors], Seq[SGD.Rating])]) =>
+        out.collect(userItem._1, userItem._2, userItem._3, rating._2)
+      }
+        //.join(ratingsGrouped).where(i => i._1._1).equalTo(0)
+
+      /*val grouped02 = ratingsGrouped.join(grouped01).where(0).equalTo(0) {
+        (rating, userItem, out: Collector[(Int, Seq[SGD.Factors], Seq[SGD.Factors], Seq[SGD.Rating])]) =>
+        out.collect(userItem._1, userItem._2, userItem._3, rating._2)
       }*/
 
-      // perform last half-step to calculate the user matrix
+      //grouped01.join(ratingsGrouped).where(0).equalTo(0).writeAsCsv("/home/dani/data/tmp/gr-rating.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
-//      instance.factorsOption = Some((
-//        unblock(users, userOut, blockIDPartitioner),
-//        unblock(pItems, itemOut, blockIDPartitioner)))
+      ratingsGrouped.writeAsCsv("/home/dani/data/tmp/ratingsGrouped.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+      grouped01.writeAsCsv("/home/dani/data/tmp/grouped01.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+
+      grouped01.print()
+      //grouped02.writeAsCsv("/home/dani/data/tmp/grouped02.csv"/*, writeMode = FileSystem.WriteMode.OVERWRITE*/).setParallelism(1)
+
+      // END OF DEBUGGING
+*/
+
+      val userItem = initUserItem.iterate(iterations) {
+        elem => {
+          val users = elem.filter(i => i._2(0).isUser)
+          val items = elem.filter(i => !i._2(0).isUser)
+
+//          val grouped = users.join(items).where(0).equalTo(0)
+//            .join(ratingsGrouped).where(i => i._1._1).equalTo(0)
+          val grouped = users.join(items).where(0).equalTo(0) {
+            (user, item, out: Collector[(Int, Seq[SGD.Factors], Seq[SGD.Factors])]) =>
+              out.collect(user._1, user._2, item._2)
+          }.join(ratingsGrouped).where(0).equalTo(0) {
+            (userItem, rating, out: Collector[(Int, Seq[SGD.Factors], Seq[SGD.Factors], Seq[SGD.Rating])]) =>
+              out.collect(userItem._1, userItem._2, userItem._3, rating._2)
+          }
+
+          val pr = grouped.map {
+            row => {
+              val group = row._1
+              val users = row._2
+              val items = row._3
+              val ratings = row._4
+
+              val userMap = collection.mutable.Map(users.map(factor => (factor.id, (factor.factors, factor.omega))).toSeq: _*)
+              val itemMap = collection.mutable.Map(items.map(factor => (factor.id, (factor.factors, factor.omega))).toSeq: _*)
+
+              Random.shuffle(ratings) foreach {
+                rating => {
+                  val (pi, omegai) = userMap(rating.user)
+                  val (qj, omegaj) = itemMap(rating.item)
+
+                  val rij = rating.rating
+
+                  val newPi = pi.zip(qj).map { case (p, q) => p - learningRate * (lambda / omegai * p - rij * q) }
+                  val newQj = pi.zip(qj).map { case (p, q) => q - learningRate * (lambda / omegaj * q - rij * p) }
+
+                  userMap.update(rating.user, (newPi, omegai))
+                  itemMap.update(rating.item, (newQj, omegaj))
+                }
+              }
+
+              val userResult = userMap.map{case (id, (fact, omega))  => new Factors(id, true, fact, omega)}.toSeq
+              val itemResult = itemMap.map{case (id, (fact, omega))  => new Factors(id, false, fact, omega)}.toSeq
+
+              // Calculating the new group ids
+              val pRow = group / numBlocks
+              val qRow = group % numBlocks
+
+              val newP = pRow + (group + 1) % numBlocks
+              val newQ = ((pRow + numBlocks - 1) % numBlocks) * numBlocks + qRow
+              ((newP, userResult), (newQ, itemResult))
+            }
+          }.setParallelism(numBlocks)
+
+
+          //pr.writeAsCsv("/home/dani/data/tmp/pr.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+
+          pr.flatMap{(a, col: Collector[(Int, Seq[SGD.Factors])]) => {
+            col.collect(a._1)
+            col.collect(a._2)
+          }}
+        }
+      }
+
+      userItem.writeAsCsv("/home/dani/data/tmp/useritem_final.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+      println("----------------------------------------------------" +
+        "CHECKPOINT 01")
+
+
+
+      val users = userItem.filter(i => i._2(0).isUser).flatMap((group, col: Collector[SGD.Factors]) => {
+        group._2.foreach(col.collect(_))
+      })
+      val items = userItem.filter(i => !i._2(0).isUser).flatMap((group, col: Collector[SGD.Factors]) => {
+        group._2.foreach(col.collect(_))
+      })
+
+      // DEBUGGING
+      users.writeAsCsv("/home/dani/data/tmp/users_final.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+      items.writeAsCsv("/home/dani/data/tmp/items_final.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+      instance.factorsOption = Some((users, items))
     }
   }
 
@@ -568,303 +586,11 @@ object SGD {
                     lambda: Double,
                     learningRate: Double):
   DataSet[(Int, Factors, Int)] = {
-    val rand = Random
-    val users = userItems.filter(_._1 == 0)
-      .map {row => (row, rand.nextInt(numBlocks))}
-
-    val items = userItems.filter(_._1 == 0)
-      .map {row => (row, rand.nextInt(numBlocks))}
-
-    val i = 1
-    val grouped = users.coGroup(items).where(1).equalTo(elem => (elem._2 + numBlocks - i) % numBlocks)
-    val groupedWithRatings = grouped reduce { (userArray, itemArray) => {
-      (userArray, itemArray)
-      }
-    }
 
     userItems
   }
 
-/*
 
-  /** Creates the meta information needed to route the item and user vectors to the respective user
-    * and item blocks.
-    * * @param userBlocks
-    * @param itemBlocks
-    * @param ratings
-    * @param blockIDPartitioner
-    * @return
-    */
-  def createBlockInformation(userBlocks: Int, itemBlocks: Int, ratings: DataSet[(Int, Rating)],
-                             blockIDPartitioner: BlockIDPartitioner):
-  (DataSet[(Int, InBlockInformation)], DataSet[(Int, OutBlockInformation)]) = {
-    val blockIDGenerator = new BlockIDGenerator(itemBlocks)
-
-    val usersPerBlock = createUsersPerBlock(ratings)
-
-    val outBlockInfos = createOutBlockInformation(ratings, usersPerBlock, itemBlocks,
-      blockIDGenerator)
-
-    val inBlockInfos = createInBlockInformation(ratings, usersPerBlock, blockIDGenerator)
-
-    (inBlockInfos, outBlockInfos)
-  }
-
-  /** Calculates the userIDs in ascending order of each user block
-    *
-    * @param ratings
-    * @return
-    */
-  def createUsersPerBlock(ratings: DataSet[(Int, Rating)]): DataSet[(Int, Array[Int])] = {
-    ratings.map{ x => (x._1, x._2.user)}.withForwardedFields("0").groupBy(0).
-      sortGroup(1, Order.ASCENDING).reduceGroup {
-      users => {
-        val result = ArrayBuffer[Int]()
-        var id = -1
-        var oldUser = -1
-
-        while(users.hasNext) {
-          val user = users.next()
-
-          id = user._1
-
-          if (user._2 != oldUser) {
-            result.+=(user._2)
-            oldUser = user._2
-          }
-        }
-
-        val userIDs = result.toArray
-        (id, userIDs)
-      }
-    }.withForwardedFields("0")
-  }
-
-  /** Creates the outgoing block information
-    *
-    * Creates for every user block the outgoing block information. The out block information
-    * contains for every item block a [[scala.collection.mutable.BitSet]] which indicates which
-    * user vector has to be sent to this block. If a vector v has to be sent to a block b, then
-    * bitsets(b)'s bit v is set to 1, otherwise 0. Additionally the user IDataSet are replaced by
-    * the user vector's index value.
-    *
-    * @param ratings
-    * @param usersPerBlock
-    * @param itemBlocks
-    * @param blockIDGenerator
-    * @return
-    */
-  def createOutBlockInformation(ratings: DataSet[(Int, Rating)],
-                                usersPerBlock: DataSet[(Int, Array[Int])],
-                                itemBlocks: Int, blockIDGenerator: BlockIDGenerator):
-  DataSet[(Int, OutBlockInformation)] = {
-    ratings.coGroup(usersPerBlock).where(0).equalTo(0).apply {
-      (ratings, users) =>
-        val userIDs = users.next()._2
-        val numUsers = userIDs.length
-
-        val userIDToPos = userIDs.zipWithIndex.toMap
-
-        val shouldDataSend = Array.fill(itemBlocks)(new scala.collection.mutable.BitSet(numUsers))
-        var blockID = -1
-        while (ratings.hasNext) {
-          val r = ratings.next()
-
-          val pos =
-            try {
-              userIDToPos(r._2.user)
-            }catch{
-              case e: NoSuchElementException =>
-                throw new RuntimeException(s"Key ${r._2.user} not  found. BlockID $blockID. " +
-                  s"Elements in block ${userIDs.take(5).mkString(", ")}. " +
-                  s"UserIDList contains ${userIDs.contains(r._2.user)}.", e)
-            }
-
-          blockID = r._1
-          shouldDataSend(blockIDGenerator(r._2.item))(pos) = true
-        }
-
-        (blockID, OutBlockInformation(userIDs, new OutLinks(shouldDataSend)))
-    }.withForwardedFieldsFirst("0").withForwardedFieldsSecond("0")
-  }
-
-  /** Creates the incoming block information
-    *
-    * Creates for every user block the incoming block information. The incoming block information
-    * contains the userIDs of the users in the respective block and for every item block a
-    * BlockRating instance. The BlockRating instance describes for every incoming set of item
-    * vectors of an item block, which user rated these items and what the rating was. For that
-    * purpose it contains for every incoming item vector a tuple of an id array us and a rating
-    * array rs. The array us contains the indices of the users having rated the respective
-    * item vector with the ratings in rs.
-    *
-    * @param ratings
-    * @param usersPerBlock
-    * @param blockIDGenerator
-    * @return
-    */
-  def createInBlockInformation(ratings: DataSet[(Int, Rating)],
-                               usersPerBlock: DataSet[(Int, Array[Int])],
-                               blockIDGenerator: BlockIDGenerator):
-  DataSet[(Int, InBlockInformation)] = {
-    // Group for every user block the users which have rated the same item and collect their ratings
-    val partialInInfos = ratings.map { x => (x._1, x._2.item, x._2.user, x._2.rating)}
-      .withForwardedFields("0").groupBy(0, 1).reduceGroup {
-      x =>
-        var userBlockID = -1
-        var itemID = -1
-        val userIDs = ArrayBuffer[Int]()
-        val ratings = ArrayBuffer[Double]()
-
-        while (x.hasNext) {
-          val (uBlockID, item, user, rating) = x.next
-          userBlockID = uBlockID
-          itemID = item
-
-          userIDs += user
-          ratings += rating
-        }
-
-        (userBlockID, blockIDGenerator(itemID), itemID, (userIDs.toArray, ratings.toArray))
-    }.withForwardedFields("0")
-
-    // Aggregate all ratings for items belonging to the same item block. Sort ascending with
-    // respect to the itemID, because later the item vectors of the update message are sorted
-    // accordingly.
-    val collectedPartialInfos = partialInInfos.groupBy(0, 1).sortGroup(2, Order.ASCENDING).
-      reduceGroup {
-        new GroupReduceFunction[(Int, Int, Int, (Array[Int], Array[Double])), (Int,
-          Int, Array[(Array[Int], Array[Double])])](){
-          val buffer = new ArrayBuffer[(Array[Int], Array[Double])]
-
-          override def reduce(iterable: lang.Iterable[(Int, Int, Int, (Array[Int],
-            Array[Double]))], collector: Collector[(Int, Int, Array[(Array[Int],
-            Array[Double])])]): Unit = {
-
-            val infos = iterable.iterator()
-            var counter = 0
-
-            var blockID = -1
-            var itemBlockID = -1
-
-            while (infos.hasNext && counter < buffer.length) {
-              val info = infos.next()
-              blockID = info._1
-              itemBlockID = info._2
-
-              buffer(counter) = info._4
-
-              counter += 1
-            }
-
-            while (infos.hasNext) {
-              val info = infos.next()
-              blockID = info._1
-              itemBlockID = info._2
-
-              buffer += info._4
-
-              counter += 1
-            }
-
-            val array = new Array[(Array[Int], Array[Double])](counter)
-
-            buffer.copyToArray(array)
-
-            collector.collect((blockID, itemBlockID, array))
-          }
-        }
-      }.withForwardedFields("0", "1")
-
-    // Aggregate all item block ratings with respect to their user block ID. Sort the blocks with
-    // respect to their itemBlockID, because the block update messages are sorted the same way
-    collectedPartialInfos.coGroup(usersPerBlock).where(0).equalTo(0).
-      sortFirstGroup(1, Order.ASCENDING).apply{
-      new CoGroupFunction[(Int, Int, Array[(Array[Int], Array[Double])]),
-        (Int, Array[Int]), (Int, InBlockInformation)] {
-        val buffer = ArrayBuffer[BlockRating]()
-
-        override def coGroup(partialInfosIterable:
-                             lang.Iterable[(Int, Int,  Array[(Array[Int], Array[Double])])],
-                             userIterable: lang.Iterable[(Int, Array[Int])],
-                             collector: Collector[(Int, InBlockInformation)]): Unit = {
-
-          val users = userIterable.iterator()
-          val partialInfos = partialInfosIterable.iterator()
-
-          val userWrapper = users.next()
-          val id = userWrapper._1
-          val userIDs = userWrapper._2
-          val userIDToPos = userIDs.zipWithIndex.toMap
-
-          var counter = 0
-
-          while (partialInfos.hasNext && counter < buffer.length) {
-            val partialInfo = partialInfos.next()
-            // entry contains the ratings and userIDs of a complete item block
-            val entry = partialInfo._3
-
-            // transform userIDs to positional indices
-            for (row <- 0 until entry.length; col <- 0 until entry(row)._1.length) {
-              entry(row)._1(col) = userIDToPos(entry(row)._1(col))
-            }
-
-            buffer(counter).ratings = entry
-
-            counter += 1
-          }
-
-          while (partialInfos.hasNext) {
-            val partialInfo = partialInfos.next()
-            // entry contains the ratings and userIDs of a complete item block
-            val entry = partialInfo._3
-
-            // transform userIDs to positional indices
-            for (row <- 0 until entry.length; col <- 0 until entry(row)._1.length) {
-              entry(row)._1(col) = userIDToPos(entry(row)._1(col))
-            }
-
-            buffer += new BlockRating(entry)
-
-            counter += 1
-          }
-
-          val array = new Array[BlockRating](counter)
-
-          buffer.copyToArray(array)
-
-          collector.collect((id, InBlockInformation(userIDs, array)))
-        }
-      }
-    }.withForwardedFieldsFirst("0").withForwardedFieldsSecond("0")
-  }
-
-
-  /** Unblocks the blocked user and item matrix representation so that it is at DataSet of
-    * column vectors.
-    *
-    * @param users
-    * @param outInfo
-    * @param blockIDPartitioner
-    * @return
-    */
-  def unblock(users: DataSet[(Int, Array[Array[Double]])],
-              outInfo: DataSet[(Int, OutBlockInformation)],
-              blockIDPartitioner: BlockIDPartitioner): DataSet[Factors] = {
-    users.join(outInfo).where(0).equalTo(0).withPartitioner(blockIDPartitioner).apply {
-      (left, right, col: Collector[Factors]) => {
-        val outInfo = right._2
-        val factors = left._2
-
-        for(i <- 0 until outInfo.elementIDs.length){
-          val id = outInfo.elementIDs(i)
-          val factorVector = factors(i)
-          col.collect(Factors(id, factorVector))
-        }
-      }
-    }
-  }
-*/
   // ================================ Math helper functions ========================================
 
 /*  def outerProduct(vector: Array[Double], matrix: Array[Double], factors: Int): Unit = {
@@ -905,14 +631,14 @@ object SGD {
   }
   */
 
-  def generateRandomMatrix(ids: DataSet[Int], factors: Int, seed: Long): DataSet[Factors] = {
-    ids map {
-      id => {
-        val random = new Random(id ^ seed)
-        Factors(id, randomFactors(factors, random))
-      }
-    }
-  }
+//  def generateRandomMatrix(ids: DataSet[Int], factors: Int, seed: Long): DataSet[Factors] = {
+//    ids map {
+//      id => {
+//        val random = new Random(id ^ seed)
+//        Factors(id, randomFactors(factors, random))
+//      }
+//    }
+//  }
 
   def randomFactors(factors: Int, random: Random): Array[Double] = {
     Array.fill(factors)(random.nextDouble())

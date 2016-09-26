@@ -44,8 +44,9 @@ object SGDtest {
 
     // Setup the ALS learner
     val sgd = SGD()
-      .setIterations(20)
-      .setNumFactors(3)
+      .setIterations(10)
+      .setNumFactors(10)
+      .setBlocks(16)
     //    .setBlocks(100)
     //    .setTemporaryPath("hdfs://tempPath")
 
@@ -72,21 +73,21 @@ object SGDtest {
 //    println("printing test dataset")
 //    testingDS.print()
     // println(s"The size of the testingDS is: $(testingDS.size)")
-
-    // val testingDS = itemIDs cross userIDs
-    // testingDS.writeAsCsv("/home/dani/data/teszt2.csv").setParallelism(1)
+*/
+    val testingDS = userIDs cross itemIDs
+    testingDS.writeAsCsv("/home/dani/data/tmp/teszt001.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
     // Calculate the ratings according to the matrix factorization
     val testingDS_100 = testingDS.first(100)
     testingDS_100.print()
+    testingDS_100.writeAsCsv("/home/dani/data/tmp/teszt100_001.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
-    val predictedRatings = als.predict(testingDS_100)
+    val predictedRatings = sgd.predict(testingDS_100)
+
+    println("teszt1")
     predictedRatings.print()
 
-
-
-    predictedRatings.writeAsCsv("/home/dani/data/movielens_flink_1.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
-*/
+    sgd.predict(testingDS_100).writeAsCsv("/home/dani/data/tmp/sgd_001.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
     // println(predictedRatings.map(x => x.toString()))
     println("teszt2")
