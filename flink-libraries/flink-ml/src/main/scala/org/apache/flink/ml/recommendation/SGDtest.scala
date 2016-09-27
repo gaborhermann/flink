@@ -33,11 +33,9 @@ object SGDtest {
     val env = ExecutionEnvironment.getExecutionEnvironment
 
     val pathToTrainingFile = "/home/dani/data/movielens1M_data.csv"
-//    val pathToTrainingFile = "/home/dani/data/selected.csv"
 
     // Read input data set from a csv file
     val inputDS: DataSet[(Int, Int, Double)] = env.readCsvFile[(Int, Int, Double)](pathToTrainingFile)
-//    inputDS.writeAsCsv(pathToTrainingFile + "_test").setParallelism(1)
 
     val userIDs = inputDS.map(_._1).distinct()
     val itemIDs = inputDS.map(_._2).distinct()
@@ -47,12 +45,11 @@ object SGDtest {
       .setIterations(10)
       .setNumFactors(10)
       .setBlocks(16)
-    //    .setBlocks(100)
-    //    .setTemporaryPath("hdfs://tempPath")
 
     // Set the other parameters via a parameter map
     val parameters = ParameterMap()
-      .add(SGD.Lambda, 0.9)
+      .add(SGD.LearningRate, 0.001)
+      .add(SGD.Lambda, 0.0)
       .add(SGD.Seed, 42L)
 
     // Calculate the factorization
@@ -60,10 +57,10 @@ object SGDtest {
 
 
     // Read the testing data set from a csv file
-//    val pathToData = "/home/dani/data/full.csv"
+    //    val pathToData = "/home/dani/data/full.csv"
     //    val testingDS = env.readCsvFile[(Int, Int)](pathToData)
 
-/*
+    /*
     val pathToData = "/home/dani/data/movielens1M_data_test_1.csv"
 
     println("-----------------------------------------")
@@ -74,11 +71,12 @@ object SGDtest {
 //    testingDS.print()
     // println(s"The size of the testingDS is: $(testingDS.size)")
 */
-    val testingDS = userIDs cross itemIDs
+    /*
+    val testingDS = userIDs.first(20) cross itemIDs.first(20)
     testingDS.writeAsCsv("/home/dani/data/tmp/teszt001.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
     // Calculate the ratings according to the matrix factorization
-    val testingDS_100 = testingDS.first(100)
+    val testingDS_100 = testingDS
     testingDS_100.print()
     testingDS_100.writeAsCsv("/home/dani/data/tmp/teszt100_001.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
@@ -89,8 +87,7 @@ object SGDtest {
 
     sgd.predict(testingDS_100).writeAsCsv("/home/dani/data/tmp/sgd_001.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
-    // println(predictedRatings.map(x => x.toString()))
-    println("teszt2")
-    // suserIDs.print()
+    print(sgd.factorsOption)
+    println("teszt2")*/
   }
 }
