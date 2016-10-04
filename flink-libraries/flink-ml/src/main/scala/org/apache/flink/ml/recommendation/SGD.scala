@@ -348,8 +348,8 @@ object SGD {
 
       instance.factorsOption match {
         case Some((userFactors, itemFactors)) => {
-          input.join(userFactors, JoinHint.REPARTITION_HASH_SECOND).where(0).equalTo(0)
-            .join(itemFactors, JoinHint.REPARTITION_HASH_SECOND).where("_1._2").equalTo(0).map {
+          input.join(userFactors, JoinHint.REPARTITION_HASH_SECOND).where(0).equalTo(i => i.id)
+            .join(itemFactors, JoinHint.REPARTITION_HASH_SECOND).where("_1._2").equalTo(i => i.id).map {
             triple => {
               val (((uID, iID), uFactors), iFactors) = triple
 
@@ -453,7 +453,7 @@ object SGD {
       val initUserItem = initialUsers.union(initialItems)
 //      initUserItem.writeAsCsv("/home/dani/data/tmp/initUser.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
-      val userItem = initUserItem.iterate(iterations) {
+      val userItem = initUserItem.iterate(iterations * numBlocks) {
         ui => updateFactors(ui, ratingsGrouped, learningRate, lambda, numBlocks)
       }
 
@@ -467,6 +467,8 @@ object SGD {
         group._2.foreach(col.collect(_))
       })
 
+      users.writeAsCsv("/home/dani/data/tmp/users_final.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+      items.writeAsCsv("/home/dani/data/tmp/items_final.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
       instance.factorsOption = Some((users, items))
     }
   }
@@ -486,10 +488,10 @@ object SGD {
     val users = userItem.filter(i => i._2(0).isUser)
     val items = userItem.filter(i => !i._2(0).isUser)
 
-    val grouped = users.join(items).where(0).equalTo(0) {
+    val grouped = users.join(items, JoinHint.REPARTITION_SORT_MERGE).where(0).equalTo(0) {
       (user, item, out: Collector[(Int, Seq[SGD.Factors], Seq[SGD.Factors])]) =>
         out.collect(user._1, user._2, item._2)
-    }.join(groupedRatings).where(0).equalTo(0) {
+    }.join(groupedRatings, JoinHint.REPARTITION_SORT_MERGE).where(0).equalTo(0) {
       (userItem, rating, out: Collector[(Int, Seq[SGD.Factors], Seq[SGD.Factors], Seq[SGD.Rating])]) =>
         out.collect(userItem._1, userItem._2, userItem._3, rating._2)
     }

@@ -18,9 +18,12 @@
 
 package org.apache.flink.ml.recommendation
 
+import com.github.fommil.netlib.BLAS.{getInstance => blas}
+import org.apache.flink.api.common.operators.base.JoinOperatorBase.JoinHint
 import org.apache.flink.api.scala._
 import org.apache.flink.core.fs.FileSystem
 import org.apache.flink.ml.common.ParameterMap
+import org.apache.flink.ml.math.BLAS
 
 object SGDtest {
   //    def main(args: Array[String]): Unit = {
@@ -42,9 +45,9 @@ object SGDtest {
 
     // Setup the ALS learner
     val sgd = SGD()
-      .setIterations(10)
+      .setIterations(20)
       .setNumFactors(10)
-      .setBlocks(16)
+      .setBlocks(4)
 
     // Set the other parameters via a parameter map
     val parameters = ParameterMap()
@@ -71,23 +74,70 @@ object SGDtest {
 //    testingDS.print()
     // println(s"The size of the testingDS is: $(testingDS.size)")
 */
-    /*
     val testingDS = userIDs.first(20) cross itemIDs.first(20)
     testingDS.writeAsCsv("/home/dani/data/tmp/teszt001.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
     // Calculate the ratings according to the matrix factorization
-    val testingDS_100 = testingDS
+    val testingDS_100 = testingDS.first(100)
     testingDS_100.print()
     testingDS_100.writeAsCsv("/home/dani/data/tmp/teszt100_001.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
-    val predictedRatings = sgd.predict(testingDS_100)
+    //val predictedRatings = sgd.predict(testingDS_100)
 
-    println("teszt1")
-    predictedRatings.print()
+    //println("teszt1")
+    //predictedRatings.print()
 
-    sgd.predict(testingDS_100).writeAsCsv("/home/dani/data/tmp/sgd_001.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+    //sgd.predict(testingDS_100).writeAsCsv("/home/dani/data/tmp/sgd_001.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
-    print(sgd.factorsOption)
-    println("teszt2")*/
+
+    //DEBUGGING
+    val input = testingDS_100
+    sgd.factorsOption match {
+      case Some((userFactors, itemFactors)) => {
+        val abc = input.join(userFactors, JoinHint.REPARTITION_HASH_SECOND).where(0).equalTo(0)
+          .join(itemFactors, JoinHint.REPARTITION_HASH_SECOND).where("_1._2").equalTo(i => i.id).map {
+          triple => {
+            val (((uID, iID), uFactors), iFactors) = triple
+
+            val uFactorsVector = uFactors.factors
+            val iFactorsVector = iFactors.factors
+
+            val prediction = blas.ddot(
+              uFactorsVector.length,
+              uFactorsVector,
+              1,
+              iFactorsVector,
+              1)
+
+            (uID, iID, prediction)
+          }
+
+            }
+        abc.writeAsCsv("/home/dani/data/tmp/output01.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+          userFactors.writeAsCsv("/home/dani/data/tmp/userF.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+
+        println(userFactors.getExecutionEnvironment.getExecutionPlan())
+        userFactors.getExecutionEnvironment.execute()
+        println("++++++++++++++++++++++++++++++++++++++++++++")
+        /*.join(itemFactors, JoinHint.REPARTITION_HASH_SECOND).where("_1._2").equalTo(i => i.id).map {
+          triple => {
+            val (((uID, iID), uFactors), iFactors) = triple
+
+            val uFactorsVector = uFactors.factors
+            val iFactorsVector = iFactors.factors
+
+            val prediction = blas.ddot(
+              uFactorsVector.length,
+              uFactorsVector,
+              1,
+              iFactorsVector,
+              1)
+
+            (uID, iID, prediction)
+          }
+
+    }*/
+      }
+    }
   }
 }
