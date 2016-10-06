@@ -39,9 +39,12 @@ import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
 
+// todo change scaladoc here:
+// - we should refer to paper about algorithm
+// - AFAIK Spark MLlib does not contain an SGD for matrix factorization, avoid referring to that
 /** Alternating least squares algorithm to calculate a matrix factorization.
   *
-  * Given a matrix `R`, SGD calculates two matricess `U` and `V` such that `R ~~ U^TV`. The
+  * Given a matrix `R`, SGD calculates two matrices `U` and `V` such that `R ~~ U^TV`. The
   * unknown row dimension is given by the number of latent factors. Since matrix factorization
   * is often used in the context of recommendation, we'll call the first matrix the user and the
   * second matrix the item matrix. The `i`th column of the user matrix is `u_i` and the `i`th
@@ -118,7 +121,16 @@ import scala.util.Random
   * [[https://github.com/apache/spark/blob/master/mllib/src/main/scala/org/apache/spark/mllib/
   * recommendation/SGD.scala here]].
   */
+// todo avoid code duplication with ALS
+// - use a common predictor with ALS
+// - maybe even create a superclass for SGD and ALS (e.g. MatrixFactorization)
 class SGD extends Predictor[SGD] {
+
+  // todo We should abstract away block indexing mechanism (creating, changing indices).
+  // It seems like a separate concern HOW we do it.
+  // We just have to know that we change indices at every iteration by some scheme.
+
+  // todo Minor note: we could accept Scala's hints (e.g. using head).
 
   import SGD._
 
@@ -308,6 +320,10 @@ object SGD {
     */
   case class Rating(user: Int, item: Int, rating: Double)
 
+  // todo maybe use the same factor model as in ALS
+  // We can eliminate isUser at the model. If needed when training, then wrap it
+  // (e.g. in a TrainingFactor class).
+  // What is omega for? Do we need it at prediction?
   /** Latent factor model vector
     *
     * @param id
@@ -315,6 +331,7 @@ object SGD {
     * @param omega
     */
   case class Factors(id: Int, isUser: Boolean, factors: Array[Double], omega: Int) extends Serializable{
+    // todo toString only needed for testing? If so, we should get rid of it here.
     override def toString = s"(id:$id,isUser:$isUser,omega:$omega,array:${factors.map(d => f"$d%1.2f").mkString(",")})"
   }
 
@@ -328,8 +345,9 @@ object SGD {
 
   // ===================================== Operations ==============================================
 
+  // todo prediction should be the same as ALS (same Factor class).
   /** Predict operation which calculates the matrix entry for the given indices  */
-  implicit val predictRating = new PredictDataSetOperation[SGD, (Int, Int), (Int ,Int, Double)] {
+  implicit val predictRating = new PredictDataSetOperation[SGD, (Int, Int), (Int, Int, Double)] {
     override def predictDataSet(
                                  instance: SGD,
                                  predictParameters: ParameterMap,
@@ -387,8 +405,11 @@ object SGD {
     : Unit = {
       val resultParameters = instance.parameters ++ fitParameters
 
+      // todo Is there a reason for the default numBlocks to be 1? In ALS it's input.count
       val numBlocks = resultParameters.get(Blocks).getOrElse(1)
+      // todo Should we persist intermediate results (as in ALS)?
       val persistencePath = resultParameters.get(TemporaryPath)
+      // todo We should use random seed for random initial factor matrix generation (as in ALS).
       val seed = resultParameters(Seed)
       val factors = resultParameters(NumFactors)
       val iterations = resultParameters(Iterations)
@@ -405,20 +426,37 @@ object SGD {
       val userIDs = ratings.map(_.user).distinct()
       val itemIDs = ratings.map(_.item).distinct()
 
+      // todo Maybe use type aliases or, even better, case classes to avoid using Int for everything.
+      // This would ensure better compile time safety (we would not mix up what all those Ints mean),
+      // and has no negative performance effect (AFAIK).
+      // todo Maybe we should use the random seed here too, along with the user id.
+      // todo Maybe create blocks in arrays right here?
+      // Might be more optimal than packing down below, not sure.
       val userGroups = userIDs.map(id => (id, Random.nextInt(numBlocks)))
-
       val itemGroups = itemIDs.map(id => (id, Random.nextInt(numBlocks)))
 
+      // todo Easier to understand, might be faster:
+      // ratings.map(_.user).distinct().count()
       val userCount = ratings.map {rating => (rating.user, 1)}.groupBy(0).sum(1)
       val itemCount = ratings.map {rating => (rating.item, 1)}.groupBy(0).sum(1)
 
-      val ratingsGrouped = ratings.join(userGroups).where(_.user).equalTo(0).join(itemGroups).where(_._1.item).equalTo(0)
+      // todo A 3-way join is hard-coded here. Can we do better? (join order optimization)
+      val ratingsGrouped = ratings
+        .join(userGroups).where(_.user).equalTo(0)
+        .join(itemGroups).where(_._1.item).equalTo(0)
+        // todo Cannot easily use pattern matching in Flink, but might worth a try.
+        // It's hard to follow what i._1._2._2 is.
+        // Flink does not accept partial functions, so a solution is to have a default case branch.
+        // todo Maybe we should take the second part to an indexing function.
+        // (userBlock * numBlocks + itemBlock)
+        // todo Maybe draw an example diagram to better explain.
         .map(i => (i._1._1, i._1._2._2 * numBlocks + i._2._2))
         .groupBy(1).reduceGroup {
           ratings => {
+            // todo Avoid sending Seqs over network. Maybe use an Array instead?
             val seq = ratings.toSeq
             val rating = seq.map(elem => elem._1)
-            val group = seq(0)._2
+            val group = seq.head._2
 
             (group, rating)
           }
@@ -426,11 +464,14 @@ object SGD {
 
       val initialUsers = userGroups
         .join(userCount).where(0).equalTo(0)
+        // todo No need for 'new' at case classes.
         .map(row => (row._1._2, new Factors(row._1._1, true,  Array.fill(factors)(Random.nextDouble()), row._2._2)))
         .groupBy(0).reduceGroup {
         users => {
+          // todo Avoid sending Seqs over network. Maybe use an Array instead?
           val seq = users.toSeq
           val factors = seq.map(elem => elem._2)
+          // todo We can use head here.
           val group = seq(0)._1 * (numBlocks + 1)
 
           (group, factors)
@@ -439,17 +480,23 @@ object SGD {
 
       val initialItems = itemGroups
         .join(itemCount).where(0).equalTo(0)
+        // todo No need for 'new' at case classes
         .map(row => (row._1._2, new Factors(row._1._1, false, Array.fill(factors)(Random.nextDouble()), row._2._2)))
         .groupBy(0).reduceGroup {
         items => {
+          // todo Avoid sending Seqs over network. Maybe use an Array instead?
           val seq = items.toSeq
           val factors = seq.map(elem => elem._2)
+          // todo We can use head here.
           val group = seq(0)._1  * (numBlocks + 1)
 
           (group, factors)
         }
       }
 
+      // todo Should we code them in one dataset by union? Maybe think of workarounds.
+      // todo We should use an enum type instead of an Int to encode whether it's a user
+      // or an item block.
       val initUserItem = initialUsers.union(initialItems)
 //      initUserItem.writeAsCsv("/home/dani/data/tmp/initUser.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
@@ -485,9 +532,14 @@ object SGD {
                     lambda: Double,
                     numBlocks: Int): DataSet[(Int, Seq[SGD.Factors])] = {
 
+    // todo Filtering here is not really efficient as we'd have to move through all the blocks.
+    // Furthermore: twice! Maybe do it after the join?
+    // i.e. groupByItems -> groupReduce ->
     val users = userItem.filter(i => i._2(0).isUser)
     val items = userItem.filter(i => !i._2(0).isUser)
 
+    // (blockId, userFactors, itemFactors, ratings)
+    // todo Optimize 3-way join?
     val grouped = users.join(items, JoinHint.REPARTITION_SORT_MERGE).where(0).equalTo(0) {
       (user, item, out: Collector[(Int, Seq[SGD.Factors], Seq[SGD.Factors])]) =>
         out.collect(user._1, user._2, item._2)
@@ -503,9 +555,12 @@ object SGD {
         val items = row._3
         val ratings = row._4
 
+        // todo Maybe we should use Arrays instead of Maps to match factors with ratings
+        //      inside one block.
         val userMap = collection.mutable.Map(users.map(factor => (factor.id, (factor.factors, factor.omega))).toSeq: _*)
         val itemMap = collection.mutable.Map(items.map(factor => (factor.id, (factor.factors, factor.omega))).toSeq: _*)
 
+        // todo Why shuffle ratings inside one block?
         Random.shuffle(ratings) foreach {
           rating => {
             val (pi, omegai) = userMap(rating.user)
@@ -513,6 +568,7 @@ object SGD {
 
             val rij = rating.rating
 
+            // todo Optimization: use LAPACK/BLAS locally.
             val newPi = pi.zip(qj).map { case (p, q) => p - learningRate * (lambda / omegai * p - rij * q) }
             val newQj = pi.zip(qj).map { case (p, q) => q - learningRate * (lambda / omegaj * q - rij * p) }
 
@@ -521,8 +577,12 @@ object SGD {
           }
         }
 
+        // todo We can avoid new at case classes.
         val userResult = userMap.map{case (id, (fact, omega))  => new Factors(id, true, fact, omega)}.toSeq
         val itemResult = itemMap.map{case (id, (fact, omega))  => new Factors(id, false, fact, omega)}.toSeq
+
+
+        // todo Abstract away group id changing mechanism.
 
         // Calculating the new group ids
         val pRow = group / numBlocks
