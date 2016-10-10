@@ -28,10 +28,11 @@ import org.apache.flink.ml.common._
 import org.apache.flink.ml.pipeline.{FitOperation, PredictDataSetOperation, Predictor}
 import org.apache.flink.types.Value
 import org.apache.flink.util.Collector
-import org.apache.flink.api.common.functions.{CoGroupFunction, GroupReduceFunction, Partitioner => FlinkPartitioner}
+import org.apache.flink.api.common.functions.{CoGroupFunction, GroupReduceFunction, RichMapFunction, Partitioner => FlinkPartitioner}
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
 import com.github.fommil.netlib.LAPACK.{getInstance => lapack}
 import org.apache.flink.core.fs.FileSystem
+import org.apache.flink.ml.optimization.LearningRateMethod.{Default, LearningRateMethodTrait}
 import org.apache.flink.ml.recommendation.SGD.LearningRate
 import org.netlib.util.intW
 
@@ -298,6 +299,10 @@ object SGD {
     val defaultValue: Option[Double] = Some(1.0)
   }
 
+  case object LearningRateMethod extends Parameter[LearningRateMethodTrait] {
+    val defaultValue: Option[LearningRateMethodTrait] = Some(Default)
+  }
+
   // ==================================== SGD type definitions =====================================
 
   /** Representation of a user-item rating
@@ -335,16 +340,6 @@ object SGD {
                                  predictParameters: ParameterMap,
                                  input: DataSet[(Int, Int)])
     : DataSet[(Int, Int, Double)] = {
-
-/*      instance.factorsOption.foreach(i => {
-        val bp1 = 0
-        println("before")
-        i._1.print()
-        println("after")
-        val bp2 = 0
-        i._2.print()
-        val bp3 = 0
-      })*/
 
       instance.factorsOption match {
         case Some((userFactors, itemFactors)) => {
@@ -394,6 +389,7 @@ object SGD {
       val iterations = resultParameters(Iterations)
       val lambda = resultParameters(Lambda)
       val learningRate = resultParameters(LearningRate)
+      val learningRateMethod = resultParameters(LearningRateMethod)
 
       val ratings = input.map {
         entry => {
@@ -453,8 +449,10 @@ object SGD {
       val initUserItem = initialUsers.union(initialItems)
 //      initUserItem.writeAsCsv("/home/dani/data/tmp/initUser.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
+      var iterCount = 0
+
       val userItem = initUserItem.iterate(iterations * numBlocks) {
-        ui => updateFactors(ui, ratingsGrouped, learningRate, lambda, numBlocks)
+        ui => updateFactors(ui, ratingsGrouped, learningRate, learningRateMethod, lambda, numBlocks)
       }
 
       userItem.writeAsCsv("/home/dani/data/tmp/useritem_final.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
@@ -482,6 +480,7 @@ object SGD {
   def updateFactors(userItem: DataSet[(Int, Seq[SGD.Factors])],
                     groupedRatings: DataSet[(Int, Seq[SGD.Rating])],
                     learningRate: Double,
+                    learningRateMethod: LearningRateMethodTrait,
                     lambda: Double,
                     numBlocks: Int): DataSet[(Int, Seq[SGD.Factors])] = {
 
@@ -496,43 +495,55 @@ object SGD {
         out.collect(userItem._1, userItem._2, userItem._3, rating._2)
     }
 
-    val pr = grouped.map {
-      row => {
-        val group = row._1
-        val users = row._2
-        val items = row._3
-        val ratings = row._4
+    val pr = grouped.map(new RichMapFunction[(Int, Seq[SGD.Factors], Seq[SGD.Factors], Seq[SGD.Rating]), ((Int, Seq[SGD.Factors]), (Int, Seq[SGD.Factors]))] {
+        override def map(row: (Int, Seq[SGD.Factors], Seq[SGD.Factors], Seq[SGD.Rating])):
+        ((Int, Seq[SGD.Factors]), (Int, Seq[SGD.Factors])) = {
+          val iteration = getIterationRuntimeContext.getSuperstepNumber / numBlocks
 
-        val userMap = collection.mutable.Map(users.map(factor => (factor.id, (factor.factors, factor.omega))).toSeq: _*)
-        val itemMap = collection.mutable.Map(items.map(factor => (factor.id, (factor.factors, factor.omega))).toSeq: _*)
+          val effectiveLearningRate = learningRateMethod.calculateLearningRate(
+            learningRate,
+            iteration + 1,
+            lambda)
 
-        Random.shuffle(ratings) foreach {
-          rating => {
-            val (pi, omegai) = userMap(rating.user)
-            val (qj, omegaj) = itemMap(rating.item)
+          println("++++++++EFFECTIVE LR:" + effectiveLearningRate.toString)
+          val group = row._1
+          val users = row._2
+          val items = row._3
+          val ratings = row._4
 
-            val rij = rating.rating
+          val userMap = collection.mutable.Map(users.map(factor => (factor.id, (factor.factors, factor.omega))).toSeq: _*)
+          val itemMap = collection.mutable.Map(items.map(factor => (factor.id, (factor.factors, factor.omega))).toSeq: _*)
 
-            val newPi = pi.zip(qj).map { case (p, q) => p - learningRate * (lambda / omegai * p - rij * q) }
-            val newQj = pi.zip(qj).map { case (p, q) => q - learningRate * (lambda / omegaj * q - rij * p) }
+          Random.shuffle(ratings) foreach {
+            rating => {
+              val (pi, omegai) = userMap(rating.user)
+              val (qj, omegaj) = itemMap(rating.item)
 
-            userMap.update(rating.user, (newPi, omegai))
-            itemMap.update(rating.item, (newQj, omegaj))
+              val rij = rating.rating
+
+              val piqj = rij - blas.ddot(pi.length, pi, 1, qj, 1)
+
+              val newPi = pi.zip(qj).map { case (p, q) => p - effectiveLearningRate * (lambda / omegai * p - piqj * q) }
+              val newQj = pi.zip(qj).map { case (p, q) => q - effectiveLearningRate * (lambda / omegaj * q - piqj * p) }
+
+              userMap.update(rating.user, (newPi, omegai))
+              itemMap.update(rating.item, (newQj, omegaj))
+            }
           }
+
+          val userResult = userMap.map{case (id, (fact, omega))  => new Factors(id, true, fact, omega)}.toSeq
+          val itemResult = itemMap.map{case (id, (fact, omega))  => new Factors(id, false, fact, omega)}.toSeq
+
+          // Calculating the new group ids
+          val pRow = group / numBlocks
+          val qRow = group % numBlocks
+
+          val newP = pRow * numBlocks + (group + 1) % numBlocks
+          val newQ = ((pRow + numBlocks - 1) % numBlocks) * numBlocks + qRow
+          ((newP, userResult), (newQ, itemResult))
         }
-
-        val userResult = userMap.map{case (id, (fact, omega))  => new Factors(id, true, fact, omega)}.toSeq
-        val itemResult = itemMap.map{case (id, (fact, omega))  => new Factors(id, false, fact, omega)}.toSeq
-
-        // Calculating the new group ids
-        val pRow = group / numBlocks
-        val qRow = group % numBlocks
-
-        val newP = pRow * numBlocks + (group + 1) % numBlocks
-        val newQ = ((pRow + numBlocks - 1) % numBlocks) * numBlocks + qRow
-        ((newP, userResult), (newQ, itemResult))
       }
-    }.setParallelism(numBlocks)
+    ).setParallelism(numBlocks)
 
     pr.flatMap{(a, col: Collector[(Int, Seq[SGD.Factors])]) => {
       col.collect(a._1)
@@ -540,58 +551,7 @@ object SGD {
     }}
   }
 
-
-
-
   // ================================ Math helper functions ========================================
-
-/*  def outerProduct(vector: Array[Double], matrix: Array[Double], factors: Int): Unit = {
-    var row = 0
-    var pos = 0
-    while(row < factors){
-      var col = 0
-      while(col <= row){
-        matrix(pos) = vector(row) * vector(col)
-        col += 1
-        pos += 1
-      }
-
-      row += 1
-    }
-  }
-
-  def generateFullMatrix(triangularMatrix: Array[Double], fullMatrix: Array[Double],
-                         factors: Int): Unit = {
-    var row = 0
-    var pos = 0
-
-    while(row < factors){
-      var col = 0
-      while(col < row){
-        fullMatrix(row*factors + col) = triangularMatrix(pos)
-        fullMatrix(col*factors + row) = triangularMatrix(pos)
-
-        pos += 1
-        col += 1
-      }
-
-      fullMatrix(row*factors + row) = triangularMatrix(pos)
-
-      pos += 1
-      row += 1
-    }
-  }
-  */
-
-//  def generateRandomMatrix(ids: DataSet[Int], factors: Int, seed: Long): DataSet[Factors] = {
-//    ids map {
-//      id => {
-//        val random = new Random(id ^ seed)
-//        Factors(id, randomFactors(factors, random))
-//      }
-//    }
-//  }
-
   def randomFactors(factors: Int, random: Random): Array[Double] = {
     Array.fill(factors)(random.nextDouble())
   }
