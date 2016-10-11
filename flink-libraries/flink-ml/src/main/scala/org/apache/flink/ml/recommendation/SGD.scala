@@ -18,31 +18,20 @@
 
 package org.apache.flink.ml.recommendation
 
-import java.{lang, util}
-
+import com.github.fommil.netlib.BLAS.{getInstance => blas}
+import org.apache.flink.api.common.functions.RichMapFunction
 import org.apache.flink.api.common.operators.base.JoinOperatorBase.JoinHint
 import org.apache.flink.api.scala._
-import org.apache.flink.api.common.operators.Order
-import org.apache.flink.core.memory.{DataInputView, DataOutputView}
-import org.apache.flink.ml.common._
-import org.apache.flink.ml.pipeline.{FitOperation, PredictDataSetOperation, Predictor}
-import org.apache.flink.types.Value
-import org.apache.flink.util.Collector
-import org.apache.flink.api.common.functions.{CoGroupFunction, GroupReduceFunction, RichMapFunction, Partitioner => FlinkPartitioner}
-import com.github.fommil.netlib.BLAS.{getInstance => blas}
-import com.github.fommil.netlib.LAPACK.{getInstance => lapack}
 import org.apache.flink.core.fs.FileSystem
+import org.apache.flink.ml.common._
 import org.apache.flink.ml.optimization.LearningRateMethod.{Default, LearningRateMethodTrait}
-import org.apache.flink.ml.recommendation.SGD.LearningRate
-import org.netlib.util.intW
-
-import scala.collection.mutable
-import scala.collection.mutable.ArrayBuffer
+import org.apache.flink.ml.pipeline.{FitOperation, PredictDataSetOperation, Predictor}
+import org.apache.flink.util.Collector
 import scala.util.Random
 
 /** Alternating least squares algorithm to calculate a matrix factorization.
   *
-  * Given a matrix `R`, SGD calculates two matricess `U` and `V` such that `R ~~ U^TV`. The
+  * Given a matrix `R`, SGD calculates two matrices `U` and `V` such that `R ~~ U^TV`. The
   * unknown row dimension is given by the number of latent factors. Since matrix factorization
   * is often used in the context of recommendation, we'll call the first matrix the user and the
   * second matrix the item matrix. The `i`th column of the user matrix is `u_i` and the `i`th
@@ -115,9 +104,6 @@ import scala.util.Random
   *  amongst too many operators. This allows the system to process bigger individual messasges and
   *  improves the overall performance. (Default value: '''None''')
   *
-  * The SGD implementation is based on Spark's MLLib implementation of SGD which you can find
-  * [[https://github.com/apache/spark/blob/master/mllib/src/main/scala/org/apache/spark/mllib/
-  * recommendation/SGD.scala here]].
   */
 class SGD extends Predictor[SGD] {
 
@@ -319,9 +305,7 @@ object SGD {
     * @param factors
     * @param omega
     */
-  case class Factors(id: Int, isUser: Boolean, factors: Array[Double], omega: Int) extends Serializable{
-    override def toString = s"(id:$id,isUser:$isUser,omega:$omega,array:${factors.map(d => f"$d%1.2f").mkString(",")})"
-  }
+  case class Factors(id: Int, isUser: Boolean, factors: Array[Double], omega: Int) extends Serializable
 
   case class Factorization(userFactors: DataSet[Factors], itemFactors: DataSet[Factors])
 
@@ -334,7 +318,7 @@ object SGD {
   // ===================================== Operations ==============================================
 
   /** Predict operation which calculates the matrix entry for the given indices  */
-  implicit val predictRating = new PredictDataSetOperation[SGD, (Int, Int), (Int ,Int, Double)] {
+  implicit val predictRating = new PredictDataSetOperation[SGD, (Int, Int), (Int, Int, Double)] {
     override def predictDataSet(
                                  instance: SGD,
                                  predictParameters: ParameterMap,
@@ -402,7 +386,6 @@ object SGD {
       val itemIDs = ratings.map(_.item).distinct()
 
       val userGroups = userIDs.map(id => (id, Random.nextInt(numBlocks)))
-
       val itemGroups = itemIDs.map(id => (id, Random.nextInt(numBlocks)))
 
       val userCount = ratings.map {rating => (rating.user, 1)}.groupBy(0).sum(1)
@@ -414,7 +397,7 @@ object SGD {
           ratings => {
             val seq = ratings.toSeq
             val rating = seq.map(elem => elem._1)
-            val group = seq(0)._2
+            val group = seq.head._2
 
             (group, rating)
           }
@@ -422,12 +405,12 @@ object SGD {
 
       val initialUsers = userGroups
         .join(userCount).where(0).equalTo(0)
-        .map(row => (row._1._2, new Factors(row._1._1, true,  Array.fill(factors)(Random.nextDouble()), row._2._2)))
+        .map(row => (row._1._2, Factors(row._1._1, true,  Array.fill(factors)(Random.nextDouble()), row._2._2)))
         .groupBy(0).reduceGroup {
         users => {
           val seq = users.toSeq
           val factors = seq.map(elem => elem._2)
-          val group = seq(0)._1 * (numBlocks + 1)
+          val group = seq.head._1 * (numBlocks + 1)
 
           (group, factors)
         }
@@ -435,38 +418,40 @@ object SGD {
 
       val initialItems = itemGroups
         .join(itemCount).where(0).equalTo(0)
-        .map(row => (row._1._2, new Factors(row._1._1, false, Array.fill(factors)(Random.nextDouble()), row._2._2)))
+        .map(row => (row._1._2, Factors(row._1._1, false, Array.fill(factors)(Random.nextDouble()), row._2._2)))
         .groupBy(0).reduceGroup {
         items => {
           val seq = items.toSeq
           val factors = seq.map(elem => elem._2)
-          val group = seq(0)._1  * (numBlocks + 1)
+          val group = seq.head._1  * (numBlocks + 1)
 
           (group, factors)
         }
       }
 
       val initUserItem = initialUsers.union(initialItems)
-//      initUserItem.writeAsCsv("/home/dani/data/tmp/initUser.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
-
-      var iterCount = 0
 
       val userItem = initUserItem.iterate(iterations * numBlocks) {
         ui => updateFactors(ui, ratingsGrouped, learningRate, learningRateMethod, lambda, numBlocks)
       }
 
+      // TODO: REMOVE FROM FINAL VERSION
       userItem.writeAsCsv("/home/dani/data/tmp/useritem_final.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
       userItem.getExecutionEnvironment.execute()
+      // END OF TODO
 
-      val users = userItem.filter(i => i._2(0).isUser).flatMap((group, col: Collector[SGD.Factors]) => {
+      val users = userItem.filter(i => i._2.head.isUser).flatMap((group, col: Collector[SGD.Factors]) => {
         group._2.foreach(col.collect(_))
       })
-      val items = userItem.filter(i => !i._2(0).isUser).flatMap((group, col: Collector[SGD.Factors]) => {
+      val items = userItem.filter(i => !i._2.head.isUser).flatMap((group, col: Collector[SGD.Factors]) => {
         group._2.foreach(col.collect(_))
       })
 
+      // TODO: REMOVE FROM FINAL VERSION
       users.writeAsCsv("/home/dani/data/tmp/users_final.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
       items.writeAsCsv("/home/dani/data/tmp/items_final.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+      // END OF TODO
+
       instance.factorsOption = Some((users, items))
     }
   }
@@ -496,8 +481,8 @@ object SGD {
     }
 
     val pr = grouped.map(new RichMapFunction[(Int, Seq[SGD.Factors], Seq[SGD.Factors], Seq[SGD.Rating]), ((Int, Seq[SGD.Factors]), (Int, Seq[SGD.Factors]))] {
-        override def map(row: (Int, Seq[SGD.Factors], Seq[SGD.Factors], Seq[SGD.Rating])):
-        ((Int, Seq[SGD.Factors]), (Int, Seq[SGD.Factors])) = {
+      override def map(row: (Int, Seq[SGD.Factors], Seq[SGD.Factors], Seq[SGD.Rating])):
+      ((Int, Seq[SGD.Factors]), (Int, Seq[SGD.Factors])) = {
           val iteration = getIterationRuntimeContext.getSuperstepNumber / numBlocks
 
           val effectiveLearningRate = learningRateMethod.calculateLearningRate(
@@ -505,7 +490,6 @@ object SGD {
             iteration + 1,
             lambda)
 
-          println("++++++++EFFECTIVE LR:" + effectiveLearningRate.toString)
           val group = row._1
           val users = row._2
           val items = row._3
@@ -531,15 +515,10 @@ object SGD {
             }
           }
 
-          val userResult = userMap.map{case (id, (fact, omega))  => new Factors(id, true, fact, omega)}.toSeq
-          val itemResult = itemMap.map{case (id, (fact, omega))  => new Factors(id, false, fact, omega)}.toSeq
+          val userResult = userMap.map{case (id, (fact, omega))  => Factors(id, true, fact, omega)}.toSeq
+          val itemResult = itemMap.map{case (id, (fact, omega))  => Factors(id, false, fact, omega)}.toSeq
 
-          // Calculating the new group ids
-          val pRow = group / numBlocks
-          val qRow = group % numBlocks
-
-          val newP = pRow * numBlocks + (group + 1) % numBlocks
-          val newQ = ((pRow + numBlocks - 1) % numBlocks) * numBlocks + qRow
+          val (newP, newQ) = nextGroup(group, numBlocks)
           ((newP, userResult), (newQ, itemResult))
         }
       }
@@ -554,5 +533,14 @@ object SGD {
   // ================================ Math helper functions ========================================
   def randomFactors(factors: Int, random: Random): Array[Double] = {
     Array.fill(factors)(random.nextDouble())
+  }
+
+  def nextGroup(currentGroup: Int, numBlocks: Int): (Int, Int) = {
+    val pRow = currentGroup / numBlocks
+    val qRow = currentGroup % numBlocks
+
+    val newP = pRow * numBlocks + (currentGroup + 1) % numBlocks
+    val newQ = ((pRow + numBlocks - 1) % numBlocks) * numBlocks + qRow
+    (newP, newQ)
   }
 }
