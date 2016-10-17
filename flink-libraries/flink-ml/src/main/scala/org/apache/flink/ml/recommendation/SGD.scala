@@ -385,6 +385,7 @@ object SGD {
       val userIDs = ratings.map(_.user).distinct()
       val itemIDs = ratings.map(_.item).distinct()
 
+      // TODO: random seed
       val userGroups = userIDs.map(id => (id, Random.nextInt(numBlocks)))
       val itemGroups = itemIDs.map(id => (id, Random.nextInt(numBlocks)))
 
@@ -405,7 +406,7 @@ object SGD {
 
       val initialUsers = userGroups
         .join(userCount).where(0).equalTo(0)
-        .map(row => (row._1._2, Factors(row._1._1, true,  Array.fill(factors)(Random.nextDouble()), row._2._2)))
+        .map(row => (row._1._2, Factors(row._1._1, true, Array.fill(factors)(Random.nextDouble()), row._2._2)))
         .groupBy(0).reduceGroup {
         users => {
           val seq = users.toSeq

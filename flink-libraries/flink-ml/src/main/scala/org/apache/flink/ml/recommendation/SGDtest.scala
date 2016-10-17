@@ -60,9 +60,12 @@ object SGDtest {
 
     testingDS.writeAsCsv("/home/dani/data/tmp/teszt001.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
 
+    //println(testingDS.getExecutionEnvironment.getExecutionPlan())
     val predictedRatings = sgd.predict(testingDS)
 
     predictedRatings.writeAsCsv("/home/dani/data/tmp/sgd_001.csv", writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+
+    println(predictedRatings.getExecutionEnvironment.getExecutionPlan())
 
     predictedRatings.getExecutionEnvironment.execute()
   }
