@@ -310,6 +310,13 @@ object SGD {
   case class Factors(id: Int, isUser: Boolean, factors: Array[Double], omega: Int)
     extends Serializable
 
+  type RatingBlockId = Int
+  case class RatingBlock(ratingBlockId: RatingBlockId, block: Seq[Rating])
+
+  def toRatingBlockId(userBlockId: Int, itemBlockId: Int, numOfBlocks: Int): RatingBlockId = {
+    userBlockId * numOfBlocks + itemBlockId
+  }
+
   case class Factorization(userFactors: DataSet[Factors], itemFactors: DataSet[Factors])
 
   // ================================= Factory methods =============================================
@@ -390,23 +397,31 @@ object SGD {
       val itemIDs = ratings.map(_.item).distinct()
 
       // TODO: maybe use better random init
-      val userGroups = userIDs.map(id => (id, new Random(id ^ seed).nextInt(numBlocks)))
-      val itemGroups = itemIDs.map(id => (id, new Random(id ^ seed).nextInt(numBlocks)))
+      val userGroups = userIDs.map(id =>
+        (id, new Random(id ^ seed).nextInt(numBlocks))
+      )
+      val itemGroups = itemIDs.map(id =>
+        (id, new Random(id ^ seed).nextInt(numBlocks))
+      )
 
       val userCount = ratings.map { rating => (rating.user, 1) }.groupBy(0).sum(1)
       val itemCount = ratings.map { rating => (rating.item, 1) }.groupBy(0).sum(1)
 
+      // todo maybe optimize 3-way join
       val ratingsGrouped = ratings
         .join(userGroups).where(_.user).equalTo(0)
         .join(itemGroups).where(_._1.item).equalTo(0)
-        .map(i => (i._1._1, i._1._2._2 * numBlocks + i._2._2))
+        .map(_ match {
+          case ((rating, (_, userBlock)), (_, itemBlock)) =>
+            (rating, toRatingBlockId(userBlock, itemBlock, numBlocks))
+        })
         .groupBy(1).reduceGroup {
         ratings => {
           val seq = ratings.toSeq
           val rating = seq.map(elem => elem._1)
           val group = seq.head._2
 
-          (group, rating)
+          RatingBlock(group, rating)
         }
       }
 
@@ -484,7 +499,7 @@ object SGD {
     * @return New value for the optimized matrix (either user or item)
     */
   def updateFactors(userItem: DataSet[(Int, Seq[SGD.Factors])],
-                    groupedRatings: DataSet[(Int, Seq[SGD.Rating])],
+                    ratingBlocks: DataSet[SGD.RatingBlock],
                     learningRate: Double,
                     learningRateMethod: LearningRateMethodTrait,
                     lambda: Double,
@@ -494,17 +509,19 @@ object SGD {
     val users = userItem.filter(i => i._2(0).isUser)
     val items = userItem.filter(i => !i._2(0).isUser)
 
-    val grouped = users.join(items, JoinHint.REPARTITION_SORT_MERGE).where(0).equalTo(0) {
+    val grouped = users
+      .join(items, JoinHint.REPARTITION_SORT_MERGE).where(0).equalTo(0) {
       (user, item, out: Collector[(Int, Seq[SGD.Factors], Seq[SGD.Factors])]) =>
         out.collect(user._1, user._2, item._2)
-    }.join(groupedRatings, JoinHint.REPARTITION_SORT_MERGE).where(0).equalTo(0) {
-      (userItem, rating,
-       out: Collector[(Int, Seq[SGD.Factors], Seq[SGD.Factors], Seq[SGD.Rating])]) =>
-        out.collect(userItem._1, userItem._2, userItem._3, rating._2)
+    }
+      .join(ratingBlocks, JoinHint.REPARTITION_SORT_MERGE).where(0).equalTo(0) {
+      (userItem, ratingBlock,
+       out: Collector[(RatingBlock, Seq[SGD.Factors], Seq[SGD.Factors])]) =>
+        out.collect(ratingBlock, userItem._2, userItem._3)
     }
 
     val pr = grouped.map(
-      new RichMapFunction[(Int, Seq[SGD.Factors], Seq[SGD.Factors], Seq[SGD.Rating]),
+      new RichMapFunction[(SGD.RatingBlock, Seq[SGD.Factors], Seq[SGD.Factors]),
         ((Int, Seq[SGD.Factors]), (Int, Seq[SGD.Factors]))] {
 
       @transient
@@ -515,8 +532,8 @@ object SGD {
         random = new Random(seed)
       }
 
-      override def map(row: (Int, Seq[SGD.Factors], Seq[SGD.Factors], Seq[SGD.Rating])):
-      ((Int, Seq[SGD.Factors]), (Int, Seq[SGD.Factors])) = {
+      override def map(row: (RatingBlock, Seq[SGD.Factors], Seq[SGD.Factors])):
+      ((RatingBlockId, Seq[SGD.Factors]), (RatingBlockId, Seq[SGD.Factors])) = {
         val iteration = getIterationRuntimeContext.getSuperstepNumber / numBlocks
 
         val effectiveLearningRate = learningRateMethod.calculateLearningRate(
@@ -524,10 +541,12 @@ object SGD {
           iteration + 1,
           lambda)
 
-        val group = row._1
+        val ratingBlock = row._1
+
+        val group = ratingBlock.ratingBlockId
         val users = row._2
         val items = row._3
-        val ratings = row._4
+        val ratings = ratingBlock.block
 
         val userMap = collection.mutable.Map(users.map(factor =>
           (factor.id, (factor.factors, factor.omega))).toSeq: _*)
@@ -576,12 +595,21 @@ object SGD {
 
   // ================================ Math helper functions ========================================
 
-  def nextGroup(currentGroup: Int, numBlocks: Int): (Int, Int) = {
-    val pRow = currentGroup / numBlocks
-    val qRow = currentGroup % numBlocks
+  /**
+    * Logic that creates the rating block id for the next iteration step,
+    * returning the next rating block ids for the current user factor block and item factor block.
+    *
+    * @param currentRatingBlock
+    * @param numFactorBlocks
+    * @return
+    */
+  def nextGroup(currentRatingBlock: RatingBlockId,
+                numFactorBlocks: Int): (RatingBlockId, RatingBlockId) = {
+    val pRow = currentRatingBlock / numFactorBlocks
+    val qRow = currentRatingBlock % numFactorBlocks
 
-    val newP = pRow * numBlocks + (currentGroup + 1) % numBlocks
-    val newQ = ((pRow + numBlocks - 1) % numBlocks) * numBlocks + qRow
+    val newP = pRow * numFactorBlocks + (currentRatingBlock + 1) % numFactorBlocks
+    val newQ = ((pRow + numFactorBlocks - 1) % numFactorBlocks) * numFactorBlocks + qRow
     (newP, newQ)
   }
 }
