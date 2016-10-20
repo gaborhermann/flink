@@ -311,7 +311,10 @@ object SGD {
     extends Serializable
 
   type RatingBlockId = Int
-  case class RatingBlock(ratingBlockId: RatingBlockId, block: Seq[Rating])
+  case class RatingBlock(id: RatingBlockId, block: Seq[Rating])
+
+  // todo sealed trait + user,item class
+  case class FactorBlock(currentRatingBlock: RatingBlockId, isUser: Boolean, factors: Seq[Factors])
 
   def toRatingBlockId(userBlockId: Int, itemBlockId: Int, numOfBlocks: Int): RatingBlockId = {
     userBlockId * numOfBlocks + itemBlockId
@@ -440,7 +443,9 @@ object SGD {
 
           (group, factors)
         }
-      }
+      } map (x => FactorBlock(x._1, isUser = true, x._2))
+
+
 
       val initialItems = itemGroups
         .join(itemCount).where(0).equalTo(0)
@@ -457,7 +462,7 @@ object SGD {
 
           (group, factors)
         }
-      }
+      } map (x => FactorBlock(x._1, isUser = false, x._2))
 
       val initUserItem = initialUsers.union(initialItems)
 
@@ -472,13 +477,13 @@ object SGD {
       userItem.getExecutionEnvironment.execute()
       // END OF TODO
 
-      val users = userItem.filter(i => i._2.head.isUser)
+      val users = userItem.filter(i => i.isUser)
         .flatMap((group, col: Collector[SGD.Factors]) => {
-          group._2.foreach(col.collect(_))
+          group.factors.foreach(col.collect(_))
         })
-      val items = userItem.filter(i => !i._2.head.isUser)
+      val items = userItem.filter(i => !i.isUser)
         .flatMap((group, col: Collector[SGD.Factors]) => {
-          group._2.foreach(col.collect(_))
+          group.factors.foreach(col.collect(_))
         })
 
       // TODO: REMOVE FROM FINAL VERSION
@@ -498,31 +503,50 @@ object SGD {
     * @param userItem Fixed matrix value for the half step
     * @return New value for the optimized matrix (either user or item)
     */
-  def updateFactors(userItem: DataSet[(Int, Seq[SGD.Factors])],
-                    ratingBlocks: DataSet[SGD.RatingBlock],
+  def updateFactors(userItem: DataSet[FactorBlock],
+                    ratingBlocks: DataSet[RatingBlock],
                     learningRate: Double,
                     learningRateMethod: LearningRateMethodTrait,
                     lambda: Double,
                     numBlocks: Int,
-                    seed: Long): DataSet[(Int, Seq[SGD.Factors])] = {
+                    seed: Long): DataSet[FactorBlock] = {
 
-    val users = userItem.filter(i => i._2(0).isUser)
-    val items = userItem.filter(i => !i._2(0).isUser)
+//    val users = userItem.filter(i => i._2(0).isUser)
+//    val items = userItem.filter(i => !i._2(0).isUser)
 
-    val grouped = users
-      .join(items, JoinHint.REPARTITION_SORT_MERGE).where(0).equalTo(0) {
-      (user, item, out: Collector[(Int, Seq[SGD.Factors], Seq[SGD.Factors])]) =>
-        out.collect(user._1, user._2, item._2)
+    def extractUserItemBlock(factorBlocks: Iterator[FactorBlock]): (FactorBlock, FactorBlock) = {
+      val b1 = factorBlocks.next()
+      val b2 = factorBlocks.next()
+
+      if (b1.isUser) {
+        (b1, b2)
+      } else {
+        (b2, b1)
+      }
     }
-      .join(ratingBlocks, JoinHint.REPARTITION_SORT_MERGE).where(0).equalTo(0) {
-      (userItem, ratingBlock,
-       out: Collector[(RatingBlock, Seq[SGD.Factors], Seq[SGD.Factors])]) =>
-        out.collect(ratingBlock, userItem._2, userItem._3)
-    }
+
+    val grouped =
+      // todo coGroup does an outer join, we need an inner join, eliminate coGroup
+      userItem.coGroup(ratingBlocks)
+        .where(factorBlock => factorBlock.currentRatingBlock)
+        .equalTo(ratingBlock => ratingBlock.id).apply {
+        (factorBlocks: Iterator[FactorBlock], ratingBlock: Iterator[RatingBlock],
+         out: Collector[(RatingBlock, FactorBlock, FactorBlock)]) =>
+          if (factorBlocks.hasNext) {
+            // There are factors matched to the current rating block,
+            // so we are updating those factors by the current rating block.
+            // We could eliminate this check with an inner join.
+
+            // there are two factor blocks, one user and one item
+            val (userBlock, itemBlock) = extractUserItemBlock(factorBlocks)
+            // there is one rating block
+            out.collect((ratingBlock.next(), userBlock, itemBlock))
+          }
+      }
 
     val pr = grouped.map(
-      new RichMapFunction[(SGD.RatingBlock, Seq[SGD.Factors], Seq[SGD.Factors]),
-        ((Int, Seq[SGD.Factors]), (Int, Seq[SGD.Factors]))] {
+      new RichMapFunction[(SGD.RatingBlock, FactorBlock, FactorBlock),
+        (FactorBlock, FactorBlock)] {
 
       @transient
       var random: Random = _
@@ -532,8 +556,8 @@ object SGD {
         random = new Random(seed)
       }
 
-      override def map(row: (RatingBlock, Seq[SGD.Factors], Seq[SGD.Factors])):
-      ((RatingBlockId, Seq[SGD.Factors]), (RatingBlockId, Seq[SGD.Factors])) = {
+      override def map(row: (RatingBlock, FactorBlock, FactorBlock)):
+      (FactorBlock, FactorBlock) = {
         val iteration = getIterationRuntimeContext.getSuperstepNumber / numBlocks
 
         val effectiveLearningRate = learningRateMethod.calculateLearningRate(
@@ -543,9 +567,9 @@ object SGD {
 
         val ratingBlock = row._1
 
-        val group = ratingBlock.ratingBlockId
-        val users = row._2
-        val items = row._3
+        val group = ratingBlock.id
+        val users = row._2.factors
+        val items = row._3.factors
         val ratings = ratingBlock.block
 
         val userMap = collection.mutable.Map(users.map(factor =>
@@ -581,12 +605,12 @@ object SGD {
           Factors(id, false, fact, omega) }.toSeq
 
         val (newP, newQ) = nextGroup(group, numBlocks)
-        ((newP, userResult), (newQ, itemResult))
+        (FactorBlock(newP, true, userResult), FactorBlock(newQ, false, itemResult))
       }
     }
     ).setParallelism(numBlocks)
 
-    pr.flatMap { (a, col: Collector[(Int, Seq[SGD.Factors])]) => {
+    pr.flatMap { (a, col: Collector[FactorBlock]) => {
       col.collect(a._1)
       col.collect(a._2)
     }
