@@ -112,7 +112,7 @@ class SGD extends Predictor[SGD] {
   import SGD._
 
   // Stores the matrix factorization after the fitting phase
-  var factorsOption: Option[(DataSet[Factors], DataSet[Factors])] = None
+  var factorsOption: Option[(DataSet[Factor], DataSet[Factor])] = None
 
   /** Sets the number of latent factors/row dimension of the latent model
     *
@@ -307,20 +307,20 @@ object SGD {
     * @param factors
     * @param omega
     */
-  case class Factors(id: Int, isUser: Boolean, factors: Array[Double], omega: Int)
+  case class Factor(id: Int, factors: Array[Double], omega: Int)
     extends Serializable
 
   type RatingBlockId = Int
   case class RatingBlock(id: RatingBlockId, block: Seq[Rating])
 
   // todo sealed trait + user,item class
-  case class FactorBlock(currentRatingBlock: RatingBlockId, isUser: Boolean, factors: Seq[Factors])
+  case class FactorBlock(currentRatingBlock: RatingBlockId, isUser: Boolean, factors: Seq[Factor])
 
   def toRatingBlockId(userBlockId: Int, itemBlockId: Int, numOfBlocks: Int): RatingBlockId = {
     userBlockId * numOfBlocks + itemBlockId
   }
 
-  case class Factorization(userFactors: DataSet[Factors], itemFactors: DataSet[Factors])
+  case class Factorization(userFactors: DataSet[Factor], itemFactors: DataSet[Factor])
 
   // ================================= Factory methods =============================================
 
@@ -411,7 +411,7 @@ object SGD {
       val itemCount = ratings.map { rating => (rating.item, 1) }.groupBy(0).sum(1)
 
       // todo maybe optimize 3-way join
-      val ratingsGrouped = ratings
+      val ratingsBlocks = ratings
         .join(userGroups).where(_.user).equalTo(0)
         .join(itemGroups).where(_._1.item).equalTo(0)
         .map(_ match {
@@ -433,7 +433,7 @@ object SGD {
         .map(row => {
           val id = row._1._1
           val random = new Random(id ^ seed)
-          (row._1._2, Factors(id, true, ALS.randomFactors(factors, random), row._2._2))
+          (row._1._2, Factor(id, ALS.randomFactors(factors, random), row._2._2))
         })
         .groupBy(0).reduceGroup {
         users => {
@@ -452,7 +452,7 @@ object SGD {
         .map(row => {
           val id = row._1._1
           val random = new Random(id ^ seed)
-          (row._1._2, Factors(id, false, ALS.randomFactors(factors, random), row._2._2))
+          (row._1._2, Factor(id, ALS.randomFactors(factors, random), row._2._2))
         })
         .groupBy(0).reduceGroup {
         items => {
@@ -467,7 +467,7 @@ object SGD {
       val initUserItem = initialUsers.union(initialItems)
 
       val userItem = initUserItem.iterate(iterations * numBlocks) {
-        ui => updateFactors(ui, ratingsGrouped, learningRate, learningRateMethod,
+        ui => updateFactors(ui, ratingsBlocks, learningRate, learningRateMethod,
           lambda, numBlocks, seed)
       }
 
@@ -478,12 +478,12 @@ object SGD {
       // END OF TODO
 
       val users = userItem.filter(i => i.isUser)
-        .flatMap((group, col: Collector[SGD.Factors]) => {
-          group.factors.foreach(col.collect(_))
+        .flatMap((group, col: Collector[SGD.Factor]) => {
+          group.factors.foreach(col.collect)
         })
       val items = userItem.filter(i => !i.isUser)
-        .flatMap((group, col: Collector[SGD.Factors]) => {
-          group.factors.foreach(col.collect(_))
+        .flatMap((group, col: Collector[SGD.Factor]) => {
+          group.factors.foreach(col.collect)
         })
 
       // TODO: REMOVE FROM FINAL VERSION
@@ -600,9 +600,9 @@ object SGD {
         }
 
         val userResult = userMap.map { case (id, (fact, omega)) =>
-          Factors(id, true, fact, omega) }.toSeq
+          Factor(id, fact, omega) }.toSeq
         val itemResult = itemMap.map { case (id, (fact, omega)) =>
-          Factors(id, false, fact, omega) }.toSeq
+          Factor(id, fact, omega) }.toSeq
 
         val (newP, newQ) = nextGroup(group, numBlocks)
         (FactorBlock(newP, true, userResult), FactorBlock(newQ, false, itemResult))
