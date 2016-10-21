@@ -310,9 +310,8 @@ object SGD {
     *
     * @param id
     * @param factors
-    * @param omega
     */
-  case class Factor(id: Int, factors: Array[Double], omega: Int)
+  case class Factor(id: Int, factors: Array[Double])
     extends Serializable
 
   type RatingBlockId = Int
@@ -323,7 +322,8 @@ object SGD {
   case class FactorBlock(factorBlockId: FactorBlockId,
                          currentRatingBlock: RatingBlockId,
                          isUser: Boolean,
-                         factors: Array[Factor]) {
+                         factors: Array[Factor],
+                         omegas: Array[Int]) {
     override def toString: String = {
       s"${if (isUser) "user" else "item" } #$factorBlockId -> ${factors.toSeq}"
     }
@@ -426,16 +426,17 @@ object SGD {
           .map(_ match {
             case ((id, factorBlockId), (_, count)) =>
               val random = new Random(id ^ seed)
-              (factorBlockId, Factor(id, ALS.randomFactors(factors, random), count))
+              (factorBlockId, Factor(id, ALS.randomFactors(factors, random)), count)
           })
           .groupBy(0).reduceGroup {
           users => {
             val arr = users.toArray
-            val factors = arr.map(elem => elem._2)
+            val factors = arr.map(_._2)
+            val omegas = arr.map(_._3)
             val factorBlockId = arr(0)._1
             val initialRatingBlock = factorBlockId * (numBlocks + 1)
 
-            FactorBlock(factorBlockId, initialRatingBlock, isUser, factors)
+            FactorBlock(factorBlockId, initialRatingBlock, isUser, factors, omegas)
           }
         }
       }
@@ -448,9 +449,9 @@ object SGD {
 
       def factorIdxInBlock(blocks: DataSet[FactorBlock]) = {
         blocks.flatMap { _ match {
-            case FactorBlock(factorBlockId, _, _, fs) =>
+            case FactorBlock(factorBlockId, _, _, fs, _) =>
               fs.zipWithIndex.map {
-                case (Factor(id, _, _), idx) =>
+                case (Factor(id, _), idx) =>
                   (id, idx, factorBlockId)
               }
           }
@@ -460,6 +461,7 @@ object SGD {
       val userIdxInBlock = factorIdxInBlock(initialUserBlocks)
       val itemIdxInBlock = factorIdxInBlock(initialItemBlocks)
 
+      // todo maybe optimize 3-way join
       val ratingBlocks = ratings
         .join(userIdxInBlock).where(_._1).equalTo(0)
         .join(itemIdxInBlock).where(_._1._2).equalTo(0)
@@ -479,24 +481,6 @@ object SGD {
             val ratingInfos = arr.map(_._2)
             RatingBlock(ratingBlockId, ratingInfos)
         }
-
-      // todo maybe optimize 3-way join
-//      val ratingsBlocks = ratings
-//        .join(userBlockIds).where(_._1).equalTo(0)
-//        .join(itemBlockIds).where(_._1._2).equalTo(0)
-//        .map(_ match {
-//          case ((rating, (_, userBlock)), (_, itemBlock)) =>
-//            (rating, toRatingBlockId(userBlock, itemBlock, numBlocks))
-//        })
-//        .groupBy(1).reduceGroup {
-//        ratings => {
-//          val seq = ratings.toSeq
-//          val rating = seq.map(elem => elem._1)
-//          val ratingBlockId = seq.head._2
-//
-//          (ratingBlockId, rating)
-//        }
-//      }
 
       val initUserItem = initialUserBlocks.union(initialItemBlocks)
 
@@ -603,28 +587,22 @@ object SGD {
           iteration + 1,
           lambda)
 
-        val ratingBlock = row._1
-
-        val group = ratingBlock.id
-        val users = row._2.factors
-        val items = row._3.factors
-        val ratings = ratingBlock.block
-
-        val userBlockId = row._2.factorBlockId
-        val itemBlockId = row._3.factorBlockId
-//
-//        val userMap = collection.mutable.Map(users.map(factor =>
-//          (factor.id, (factor.factors, factor.omega))).toSeq: _*)
-//        val itemMap = collection.mutable.Map(items.map(factor =>
-//          (factor.id, (factor.factors, factor.omega))).toSeq: _*)
+        val (
+          RatingBlock(ratingBlockId, ratings),
+          FactorBlock(userBlockId, _, _, users, userOmegas),
+          FactorBlock(itemBlockId, _, _, items, itemOmegas)
+          ) = row
 
         // todo shuffle ratings deterministically
         //          random.shuffle(ratings) foreach {
 //        val ratings2 = ratings.sortBy(r => (r.user, r.item))
         ratings foreach {
           rating => {
-            val Factor(pId, pi, omegai) = users(rating.userIdx)
-            val Factor(qId, qj, omegaj) = items(rating.itemIdx)
+            val Factor(pId, pi) = users(rating.userIdx)
+            val omegai = userOmegas(rating.userIdx)
+
+            val Factor(qId, qj) = items(rating.itemIdx)
+            val omegaj = itemOmegas(rating.itemIdx)
 
             val rij = rating.rating
 
@@ -635,21 +613,14 @@ object SGD {
             val newQj = pi.zip(qj).map { case (p, q) =>
               q - effectiveLearningRate * (lambda / omegaj * q - piqj * p) }
 
-            users(rating.userIdx) = Factor(pId, newPi, omegai)
-            items(rating.itemIdx) = Factor(qId, newQj, omegaj)
-//            userMap.update(rating.user, (newPi, omegai))
-//            itemMap.update(rating.item, (newQj, omegaj))
+            users(rating.userIdx) = Factor(pId, newPi)
+            items(rating.itemIdx) = Factor(qId, newQj)
           }
         }
 
-//        val userResult = userMap.map { case (id, (fact, omega)) =>
-//          Factor(id, fact, omega) }.toSeq
-//        val itemResult = itemMap.map { case (id, (fact, omega)) =>
-//          Factor(id, fact, omega) }.toSeq
-
-        val (newP, newQ) = nextGroup(group, numBlocks)
-        (FactorBlock(userBlockId, newP, isUser = true, users),
-          FactorBlock(itemBlockId, newQ, isUser = false, items))
+        val (newP, newQ) = nextGroup(ratingBlockId, numBlocks)
+        (FactorBlock(userBlockId, newP, isUser = true, users, userOmegas),
+          FactorBlock(itemBlockId, newQ, isUser = false, items, itemOmegas))
       }
     }
     ).setParallelism(numBlocks)
