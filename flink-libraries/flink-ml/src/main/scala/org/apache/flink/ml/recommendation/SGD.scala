@@ -329,6 +329,8 @@ object SGD {
     }
   }
 
+  case class UnblockInformation(factorBlockId: FactorBlockId, factorIds: Array[Int])
+
   def toRatingBlockId(userBlockId: FactorBlockId,
                       itemBlockId: FactorBlockId,
                       numOfBlocks: Int): RatingBlockId = {
@@ -382,6 +384,74 @@ object SGD {
     }
   }
 
+  def initFactorBlockAndIndices(factorIdsForRatings: DataSet[Int],
+                                isUser: Boolean,
+                                numBlocks: Int,
+                                seed: Long,
+                                factors: Int):
+  (DataSet[FactorBlock], DataSet[(Int, Int, FactorBlockId)], DataSet[UnblockInformation]) = {
+
+    val factorIDs = factorIdsForRatings.distinct()
+
+    val factorBlockIds: DataSet[(Int, FactorBlockId)] = factorIDs.map(id =>
+      (id, new Random(id ^ seed).nextInt(numBlocks))
+    )
+
+    val factorCounts = factorIdsForRatings.map((_, 1)).groupBy(0).sum(1)
+
+    val initialFactorBlocks =
+      factorBlockIds
+        .join(factorCounts).where(0).equalTo(0)
+        .map(_ match {
+          case ((id, factorBlockId), (_, count)) =>
+            val random = new Random(id ^ seed)
+            (factorBlockId, Factor(id, ALS.randomFactors(factors, random)), count)
+        })
+        .groupBy(0).reduceGroup {
+        users => {
+          val arr = users.toArray
+          val factors = arr.map(_._2)
+          val omegas = arr.map(_._3)
+          val factorBlockId = arr(0)._1
+          val initialRatingBlock = factorBlockId * (numBlocks + 1)
+
+          val factorIds = factors.map(_.id)
+
+          (FactorBlock(factorBlockId, initialRatingBlock, isUser, factors.map(_.factors), omegas),
+            factorIds)
+        }
+      }
+
+    val factorIdxInBlock = initialFactorBlocks
+      .map(x => (x._1.factorBlockId, x._2))
+      .flatMap {
+        _ match {
+          case (factorBlockId, ids) =>
+            ids.zipWithIndex.map {
+              case (id, idx) =>
+                (id, idx, factorBlockId)
+            }
+        }
+      }
+
+    val unblockInfo = initialFactorBlocks
+      .map(x => UnblockInformation(x._1.factorBlockId, x._2))
+
+    (initialFactorBlocks.map(_._1), factorIdxInBlock, unblockInfo)
+  }
+
+  def unblock(factorBlocks: DataSet[FactorBlock],
+              unblockInfo: DataSet[UnblockInformation],
+              isUser: Boolean): DataSet[Factor] = {
+    factorBlocks
+      .filter(i => i.isUser == isUser)
+      .join(unblockInfo).where(_.factorBlockId).equalTo(_.factorBlockId)
+      .flatMap(x => x match {
+        case (FactorBlock(_, _, _, factorsInBlock, _), UnblockInformation(_, ids)) =>
+          ids.zip(factorsInBlock).map(x => Factor(x._1, x._2))
+      })
+  }
+
   /** Calculates the matrix factorization for the given ratings. A rating is defined as
     * a tuple of user ID, item ID and the corresponding rating.
     *
@@ -406,71 +476,10 @@ object SGD {
 
       val ratings = input
 
-      val userIDs = ratings.map(_._1).distinct()
-      val itemIDs = ratings.map(_._2).distinct()
-
-      // TODO: maybe use better random init
-      val userBlockIds: DataSet[(Int, FactorBlockId)] = userIDs.map(id =>
-        (id, new Random(id ^ seed).nextInt(numBlocks))
-      )
-      val itemBlockIds: DataSet[(Int, FactorBlockId)] = itemIDs.map(id =>
-        (id, new Random(id ^ seed).nextInt(numBlocks))
-      )
-
-      def initialFactorBlocks(factorBlockIds: DataSet[(Int, FactorBlockId)],
-                              factorCounts: DataSet[(Int, Int)],
-                              isUser: Boolean) = {
-
-        factorBlockIds
-          .join(factorCounts).where(0).equalTo(0)
-          .map(_ match {
-            case ((id, factorBlockId), (_, count)) =>
-              val random = new Random(id ^ seed)
-              (factorBlockId, Factor(id, ALS.randomFactors(factors, random)), count)
-          })
-          .groupBy(0).reduceGroup {
-          users => {
-            val arr = users.toArray
-            val factors = arr.map(_._2)
-            val omegas = arr.map(_._3)
-            val factorBlockId = arr(0)._1
-            val initialRatingBlock = factorBlockId * (numBlocks + 1)
-
-            val factorIds = factors.map(_.id)
-
-            (FactorBlock(factorBlockId, initialRatingBlock, isUser, factors.map(_.factors), omegas),
-            factorIds)
-          }
-        }
-      }
-
-      val userCounts = ratings.map { rating => (rating._1, 1) }.groupBy(0).sum(1)
-      val itemCounts = ratings.map { rating => (rating._2, 1) }.groupBy(0).sum(1)
-
-      val initialUserBlocks =
-        initialFactorBlocks(userBlockIds, userCounts, isUser = true)
-      val initialItemBlocks =
-        initialFactorBlocks(itemBlockIds, itemCounts, isUser = false)
-
-      def factorIdxInBlock(blocks: DataSet[(FactorBlockId, Array[Int])]) = {
-        blocks.flatMap { _ match {
-            case (factorBlockId, ids) =>
-              ids.zipWithIndex.map {
-                case (id, idx) =>
-                  (id, idx, factorBlockId)
-              }
-          }
-        }
-      }
-
-
-      val userIdBlockInfo = initialUserBlocks
-        .map(x => (x._1.factorBlockId, x._2))
-      val itemIdBlockInfo = initialItemBlocks
-        .map(x => (x._1.factorBlockId, x._2))
-
-      val userIdxInBlock = factorIdxInBlock(userIdBlockInfo)
-      val itemIdxInBlock = factorIdxInBlock(itemIdBlockInfo)
+      val (initialUserBlocks, userIdxInBlock, userUnblockInfo) =
+        initFactorBlockAndIndices(ratings.map(_._1), isUser = true, numBlocks, seed, factors)
+      val (initialItemBlocks, itemIdxInBlock, itemUnblockInfo) =
+        initFactorBlockAndIndices(ratings.map(_._2), isUser = false, numBlocks, seed, factors)
 
       // todo maybe optimize 3-way join
       val ratingBlocks = ratings
@@ -493,8 +502,7 @@ object SGD {
             RatingBlock(ratingBlockId, ratingInfos)
         }
 
-      val initUserItem = initialUserBlocks.map(_._1)
-        .union(initialItemBlocks.map(_._1))
+      val initUserItem = initialUserBlocks.union(initialItemBlocks)
 
       val userItem = initUserItem.iterate(iterations * numBlocks) {
         ui => updateFactors(ui, ratingBlocks, learningRate, learningRateMethod,
@@ -507,19 +515,8 @@ object SGD {
       userItem.getExecutionEnvironment.execute()
       // END OF TODO
 
-      // unblock
-      val users: DataSet[Factor] = userItem.filter(i => i.isUser)
-        .join(userIdBlockInfo).where(_.factorBlockId).equalTo(0)
-        .flatMap(x => x match {
-          case (FactorBlock(_, _, _, factorsInBlock, _), (_, ids)) =>
-            ids.zip(factorsInBlock).map(x => Factor(x._1, x._2))
-        })
-      val items = userItem.filter(i => !i.isUser)
-        .join(itemIdBlockInfo).where(_.factorBlockId).equalTo(0)
-        .flatMap(x => x match {
-          case (FactorBlock(_, _, _, factorsInBlock, _), (_, ids)) =>
-            ids.zip(factorsInBlock).map(x => Factor(x._1, x._2))
-        })
+      val users = unblock(userItem, userUnblockInfo, isUser = true)
+      val items = unblock(userItem, itemUnblockInfo, isUser = false)
 
       // TODO: REMOVE FROM FINAL VERSION
       users.writeAsCsv("/home/ghermann/tmp/users_final.csv",
