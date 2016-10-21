@@ -546,9 +546,6 @@ object SGD {
                     numBlocks: Int,
                     seed: Long): DataSet[FactorBlock] = {
 
-//    val users = userItem.filter(i => i._2(0).isUser)
-//    val items = userItem.filter(i => !i._2(0).isUser)
-
     def extractUserItemBlock(factorBlocks: Iterator[FactorBlock]): (FactorBlock, FactorBlock) = {
       val b1 = factorBlocks.next()
       val b2 = factorBlocks.next()
@@ -587,14 +584,6 @@ object SGD {
       new RichMapFunction[(SGD.RatingBlock, FactorBlock, FactorBlock),
         (FactorBlock, FactorBlock)] {
 
-      @transient
-      var random: Random = _
-
-      override def open(parameters: Configuration): Unit = {
-        // todo use optional seed
-        random = new Random(seed)
-      }
-
       override def map(row: (RatingBlock, FactorBlock, FactorBlock)):
       (FactorBlock, FactorBlock) = {
         val iteration = getIterationRuntimeContext.getSuperstepNumber / numBlocks
@@ -610,10 +599,10 @@ object SGD {
           FactorBlock(itemBlockId, _, _, items, itemOmegas)
           ) = row
 
-        // todo shuffle ratings deterministically
-        //          random.shuffle(ratings) foreach {
-//        val ratings2 = ratings.sortBy(r => (r.user, r.item))
-        ratings foreach {
+        val random = new Random(iteration ^ ratingBlockId ^ seed)
+        val shuffleIdxs = random.shuffle[Int, IndexedSeq](ratings.indices)
+
+        shuffleIdxs.map(ratingIdx => ratings(ratingIdx)) foreach {
           rating => {
             val pi = users(rating.userIdx)
             val omegai = userOmegas(rating.userIdx)
