@@ -304,8 +304,7 @@ object SGD {
     */
   case class RatingInfo(rating: Double,
                         userIdx: IndexInFactorBlock,
-                        itemIdx: IndexInFactorBlock,
-                       uiId: (Int, Int))
+                        itemIdx: IndexInFactorBlock)
 
   /** Latent factor model vector
     *
@@ -467,7 +466,7 @@ object SGD {
         .map(_ match {
           case (((user, item, rating), (_, userIdx, userBlockId)), (_, itemIdx, itemBlockId)) =>
             (toRatingBlockId(userBlockId, itemBlockId, numBlocks),
-              RatingInfo(rating, userIdx, itemIdx, (user, item)),
+              RatingInfo(rating, userIdx, itemIdx),
               // todo eliminate this last item, only needed for deterministic result
               (user, item))
         })
@@ -481,7 +480,6 @@ object SGD {
             RatingBlock(ratingBlockId, ratingInfos)
         }
 
-      ratingBlocks.collect.foreach(println)
       // todo maybe optimize 3-way join
 //      val ratingsBlocks = ratings
 //        .join(userBlockIds).where(_._1).equalTo(0)
@@ -502,9 +500,6 @@ object SGD {
 
       val initUserItem = initialUserBlocks.union(initialItemBlocks)
 
-      initUserItem.collect.foreach(println)
-      println("_-----------------_")
-
       val userItem = initUserItem.iterate(iterations * numBlocks) {
         ui => updateFactors(ui, ratingBlocks, learningRate, learningRateMethod,
           lambda, numBlocks, seed)
@@ -515,8 +510,6 @@ object SGD {
         writeMode =FileSystem.WriteMode.OVERWRITE).setParallelism(1)
       userItem.getExecutionEnvironment.execute()
       // END OF TODO
-
-      userItem.collect.foreach(println)
 
       val users = userItem.filter(i => i.isUser)
         .flatMap((group, col: Collector[SGD.Factor]) => {
