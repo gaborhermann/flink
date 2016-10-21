@@ -322,7 +322,7 @@ object SGD {
   case class FactorBlock(factorBlockId: FactorBlockId,
                          currentRatingBlock: RatingBlockId,
                          isUser: Boolean,
-                         factors: Array[Factor],
+                         factors: Array[Array[Double]],
                          omegas: Array[Int]) {
     override def toString: String = {
       s"${if (isUser) "user" else "item" } #$factorBlockId -> ${factors.toSeq}"
@@ -436,7 +436,10 @@ object SGD {
             val factorBlockId = arr(0)._1
             val initialRatingBlock = factorBlockId * (numBlocks + 1)
 
-            FactorBlock(factorBlockId, initialRatingBlock, isUser, factors, omegas)
+            val factorIds = factors.map(_.id)
+
+            (FactorBlock(factorBlockId, initialRatingBlock, isUser, factors.map(_.factors), omegas),
+            factorIds)
           }
         }
       }
@@ -444,22 +447,30 @@ object SGD {
       val userCounts = ratings.map { rating => (rating._1, 1) }.groupBy(0).sum(1)
       val itemCounts = ratings.map { rating => (rating._2, 1) }.groupBy(0).sum(1)
 
-      val initialUserBlocks = initialFactorBlocks(userBlockIds, userCounts, isUser = true)
-      val initialItemBlocks = initialFactorBlocks(itemBlockIds, itemCounts, isUser = false)
+      val initialUserBlocks =
+        initialFactorBlocks(userBlockIds, userCounts, isUser = true)
+      val initialItemBlocks =
+        initialFactorBlocks(itemBlockIds, itemCounts, isUser = false)
 
-      def factorIdxInBlock(blocks: DataSet[FactorBlock]) = {
+      def factorIdxInBlock(blocks: DataSet[(FactorBlockId, Array[Int])]) = {
         blocks.flatMap { _ match {
-            case FactorBlock(factorBlockId, _, _, fs, _) =>
-              fs.zipWithIndex.map {
-                case (Factor(id, _), idx) =>
+            case (factorBlockId, ids) =>
+              ids.zipWithIndex.map {
+                case (id, idx) =>
                   (id, idx, factorBlockId)
               }
           }
         }
       }
 
-      val userIdxInBlock = factorIdxInBlock(initialUserBlocks)
-      val itemIdxInBlock = factorIdxInBlock(initialItemBlocks)
+
+      val userIdBlockInfo = initialUserBlocks
+        .map(x => (x._1.factorBlockId, x._2))
+      val itemIdBlockInfo = initialItemBlocks
+        .map(x => (x._1.factorBlockId, x._2))
+
+      val userIdxInBlock = factorIdxInBlock(userIdBlockInfo)
+      val itemIdxInBlock = factorIdxInBlock(itemIdBlockInfo)
 
       // todo maybe optimize 3-way join
       val ratingBlocks = ratings
@@ -482,7 +493,8 @@ object SGD {
             RatingBlock(ratingBlockId, ratingInfos)
         }
 
-      val initUserItem = initialUserBlocks.union(initialItemBlocks)
+      val initUserItem = initialUserBlocks.map(_._1)
+        .union(initialItemBlocks.map(_._1))
 
       val userItem = initUserItem.iterate(iterations * numBlocks) {
         ui => updateFactors(ui, ratingBlocks, learningRate, learningRateMethod,
@@ -495,13 +507,18 @@ object SGD {
       userItem.getExecutionEnvironment.execute()
       // END OF TODO
 
-      val users = userItem.filter(i => i.isUser)
-        .flatMap((group, col: Collector[SGD.Factor]) => {
-          group.factors.foreach(col.collect)
+      // unblock
+      val users: DataSet[Factor] = userItem.filter(i => i.isUser)
+        .join(userIdBlockInfo).where(_.factorBlockId).equalTo(0)
+        .flatMap(x => x match {
+          case (FactorBlock(_, _, _, factorsInBlock, _), (_, ids)) =>
+            ids.zip(factorsInBlock).map(x => Factor(x._1, x._2))
         })
       val items = userItem.filter(i => !i.isUser)
-        .flatMap((group, col: Collector[SGD.Factor]) => {
-          group.factors.foreach(col.collect)
+        .join(itemIdBlockInfo).where(_.factorBlockId).equalTo(0)
+        .flatMap(x => x match {
+          case (FactorBlock(_, _, _, factorsInBlock, _), (_, ids)) =>
+            ids.zip(factorsInBlock).map(x => Factor(x._1, x._2))
         })
 
       // TODO: REMOVE FROM FINAL VERSION
@@ -598,10 +615,10 @@ object SGD {
 //        val ratings2 = ratings.sortBy(r => (r.user, r.item))
         ratings foreach {
           rating => {
-            val Factor(pId, pi) = users(rating.userIdx)
+            val pi = users(rating.userIdx)
             val omegai = userOmegas(rating.userIdx)
 
-            val Factor(qId, qj) = items(rating.itemIdx)
+            val qj = items(rating.itemIdx)
             val omegaj = itemOmegas(rating.itemIdx)
 
             val rij = rating.rating
@@ -613,8 +630,8 @@ object SGD {
             val newQj = pi.zip(qj).map { case (p, q) =>
               q - effectiveLearningRate * (lambda / omegaj * q - piqj * p) }
 
-            users(rating.userIdx) = Factor(pId, newPi)
-            items(rating.itemIdx) = Factor(qId, newQj)
+            users(rating.userIdx) = newPi
+            items(rating.itemIdx) = newQj
           }
         }
 
