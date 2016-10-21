@@ -58,6 +58,9 @@ class SGDITSuite
 
     val predictions = dsgd.predict(testData).collect()
 
+    predictions.foreach(println)
+    println("------------------")
+
     predictions.length should equal(expectedResultSGD.length)
 
     val resultMap = expectedResultSGD map {

@@ -29,6 +29,7 @@ import org.apache.flink.ml.optimization.LearningRateMethod.{Default, LearningRat
 import org.apache.flink.ml.pipeline.{FitOperation, PredictDataSetOperation, Predictor}
 import org.apache.flink.util.Collector
 
+import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
 
 /** Alternating least squares algorithm to calculate a matrix factorization.
@@ -293,13 +294,15 @@ object SGD {
 
   // ==================================== SGD type definitions =====================================
 
+  type IndexInFactorBlock = Int
+
   /** Representation of a user-item rating
     *
     * @param user User ID of the rating user
     * @param item Item iD of the rated item
     * @param rating Rating value
     */
-  case class Rating(user: Int, item: Int, rating: Double)
+  case class RatingInfo(rating: Double, userIdx: IndexInFactorBlock, itemIdx: IndexInFactorBlock)
 
   /** Latent factor model vector
     *
@@ -311,10 +314,10 @@ object SGD {
     extends Serializable
 
   type RatingBlockId = Int
-  case class RatingBlock(id: RatingBlockId, block: Seq[Rating])
+  case class RatingBlock(id: RatingBlockId, block: Array[RatingInfo])
 
   // todo sealed trait + user,item class
-  case class FactorBlock(currentRatingBlock: RatingBlockId, isUser: Boolean, factors: Seq[Factor])
+  case class FactorBlock(currentRatingBlock: RatingBlockId, isUser: Boolean, factors: Array[Factor])
 
   def toRatingBlockId(userBlockId: Int, itemBlockId: Int, numOfBlocks: Int): RatingBlockId = {
     userBlockId * numOfBlocks + itemBlockId
@@ -389,85 +392,101 @@ object SGD {
       val learningRate = resultParameters(LearningRate)
       val learningRateMethod = resultParameters(LearningRateMethod)
 
-      val ratings = input.map {
-        entry => {
-          val (userID, itemID, rating) = entry
-          Rating(userID, itemID, rating)
-        }
-      }
+      val ratings = input
 
-      val userIDs = ratings.map(_.user).distinct()
-      val itemIDs = ratings.map(_.item).distinct()
+      val userIDs = ratings.map(_._1).distinct()
+      val itemIDs = ratings.map(_._2).distinct()
 
       // TODO: maybe use better random init
-      val userGroups = userIDs.map(id =>
+      val userBlockIds = userIDs.map(id =>
         (id, new Random(id ^ seed).nextInt(numBlocks))
       )
-      val itemGroups = itemIDs.map(id =>
+      val itemBlockIds = itemIDs.map(id =>
         (id, new Random(id ^ seed).nextInt(numBlocks))
       )
 
-      val userCount = ratings.map { rating => (rating.user, 1) }.groupBy(0).sum(1)
-      val itemCount = ratings.map { rating => (rating.item, 1) }.groupBy(0).sum(1)
+      def initialFactorBlocks(factorBlockIds: DataSet[(Int, Int)], isUser: Boolean) = {
+        val factorCount = ratings.map { rating => (rating._1, 1) }.groupBy(0).sum(1)
 
-      // todo maybe optimize 3-way join
-      val ratingsBlocks = ratings
-        .join(userGroups).where(_.user).equalTo(0)
-        .join(itemGroups).where(_._1.item).equalTo(0)
-        .map(_ match {
-          case ((rating, (_, userBlock)), (_, itemBlock)) =>
-            (rating, toRatingBlockId(userBlock, itemBlock, numBlocks))
-        })
-        .groupBy(1).reduceGroup {
-        ratings => {
-          val seq = ratings.toSeq
-          val rating = seq.map(elem => elem._1)
-          val group = seq.head._2
+        factorBlockIds
+          .join(factorCount).where(0).equalTo(0)
+          .map(row => {
+            val id = row._1._1
+            val random = new Random(id ^ seed)
+            (row._1._2, Factor(id, ALS.randomFactors(factors, random), row._2._2))
+          })
+          .groupBy(0).reduceGroup {
+          users => {
+            val arr = users.toArray
+            val factors = arr.map(elem => elem._2)
+            val factorBlock = arr(0)._1
+            val initialRatingBlock = factorBlock * (numBlocks + 1)
 
-          RatingBlock(group, rating)
+            FactorBlock(initialRatingBlock, isUser, factors)
+          }
         }
       }
 
-      val initialUsers = userGroups
-        .join(userCount).where(0).equalTo(0)
-        .map(row => {
-          val id = row._1._1
-          val random = new Random(id ^ seed)
-          (row._1._2, Factor(id, ALS.randomFactors(factors, random), row._2._2))
-        })
-        .groupBy(0).reduceGroup {
-        users => {
-          val seq = users.toSeq
-          val factors = seq.map(elem => elem._2)
-          val group = seq.head._1 * (numBlocks + 1)
+      val initialUserBlocks = initialFactorBlocks(userBlockIds, isUser = true)
+      val initialItemBlocks = initialFactorBlocks(itemBlockIds, isUser = false)
 
-          (group, factors)
+      def factorIdxInBlock(blocks: DataSet[FactorBlock]) = {
+        blocks.flatMap { _ match {
+            case FactorBlock(ratingBlockId, _, fs) =>
+              fs.zipWithIndex.map {
+                case (Factor(id, _, _), idx) =>
+                  (id, idx, ratingBlockId)
+              }
+          }
         }
-      } map (x => FactorBlock(x._1, isUser = true, x._2))
+      }
 
+      val userIdxInBlock = factorIdxInBlock(initialUserBlocks)
+      val itemIdxInBlock = factorIdxInBlock(initialItemBlocks)
 
-
-      val initialItems = itemGroups
-        .join(itemCount).where(0).equalTo(0)
-        .map(row => {
-          val id = row._1._1
-          val random = new Random(id ^ seed)
-          (row._1._2, Factor(id, ALS.randomFactors(factors, random), row._2._2))
+      val ratingBlocks = ratings
+        .join(userIdxInBlock).where(_._1).equalTo(0)
+        .join(itemIdxInBlock).where(_._1._2).equalTo(0)
+        .map(_ match {
+          case (((user, item, rating), (_, userIdx, userBlockId)), (_, itemIdx, itemBlockId)) =>
+            (toRatingBlockId(userBlockId, itemBlockId, numBlocks),
+              RatingInfo(rating, userIdx, itemIdx),
+              // todo eliminate this last item, only needed for deterministic result
+              (user, item))
         })
-        .groupBy(0).reduceGroup {
-        items => {
-          val seq = items.toSeq
-          val factors = seq.map(elem => elem._2)
-          val group = seq.head._1 * (numBlocks + 1)
-
-          (group, factors)
+        .groupBy(0)
+        .reduceGroup {
+          ratings =>
+            // todo eliminate sorting, only needed for deterministic result
+            val arr = ratings.toArray.sortBy(_._3)
+            val ratingBlockId = arr(0)._1
+            val ratingInfos = arr.map(_._2)
+            RatingBlock(ratingBlockId, ratingInfos)
         }
-      } map (x => FactorBlock(x._1, isUser = false, x._2))
 
-      val initUserItem = initialUsers.union(initialItems)
+      ratingBlocks.collect.foreach(println)
+      // todo maybe optimize 3-way join
+//      val ratingsBlocks = ratings
+//        .join(userBlockIds).where(_._1).equalTo(0)
+//        .join(itemBlockIds).where(_._1._2).equalTo(0)
+//        .map(_ match {
+//          case ((rating, (_, userBlock)), (_, itemBlock)) =>
+//            (rating, toRatingBlockId(userBlock, itemBlock, numBlocks))
+//        })
+//        .groupBy(1).reduceGroup {
+//        ratings => {
+//          val seq = ratings.toSeq
+//          val rating = seq.map(elem => elem._1)
+//          val ratingBlockId = seq.head._2
+//
+//          (ratingBlockId, rating)
+//        }
+//      }
+
+      val initUserItem = initialUserBlocks.union(initialItemBlocks)
 
       val userItem = initUserItem.iterate(iterations * numBlocks) {
-        ui => updateFactors(ui, ratingsBlocks, learningRate, learningRateMethod,
+        ui => updateFactors(ui, ratingBlocks, learningRate, learningRateMethod,
           lambda, numBlocks, seed)
       }
 
@@ -532,7 +551,7 @@ object SGD {
         .equalTo(ratingBlock => ratingBlock.id).apply {
         (factorBlocks: Iterator[FactorBlock], ratingBlock: Iterator[RatingBlock],
          out: Collector[(RatingBlock, FactorBlock, FactorBlock)]) =>
-          if (factorBlocks.hasNext) {
+          if (factorBlocks.hasNext && ratingBlock.hasNext) {
             // There are factors matched to the current rating block,
             // so we are updating those factors by the current rating block.
             // We could eliminate this check with an inner join.
@@ -541,6 +560,9 @@ object SGD {
             val (userBlock, itemBlock) = extractUserItemBlock(factorBlocks)
             // there is one rating block
             out.collect((ratingBlock.next(), userBlock, itemBlock))
+          } else {
+            println(s"No factor blocks (${!factorBlocks.hasNext})" +
+              s"or no rating block (${!ratingBlock.hasNext})")
           }
       }
 
@@ -571,19 +593,19 @@ object SGD {
         val users = row._2.factors
         val items = row._3.factors
         val ratings = ratingBlock.block
-
-        val userMap = collection.mutable.Map(users.map(factor =>
-          (factor.id, (factor.factors, factor.omega))).toSeq: _*)
-        val itemMap = collection.mutable.Map(items.map(factor =>
-          (factor.id, (factor.factors, factor.omega))).toSeq: _*)
+//
+//        val userMap = collection.mutable.Map(users.map(factor =>
+//          (factor.id, (factor.factors, factor.omega))).toSeq: _*)
+//        val itemMap = collection.mutable.Map(items.map(factor =>
+//          (factor.id, (factor.factors, factor.omega))).toSeq: _*)
 
         // todo shuffle ratings deterministically
         //          random.shuffle(ratings) foreach {
-        val ratings2 = ratings.sortBy(r => (r.user, r.item))
-        ratings2 foreach {
+//        val ratings2 = ratings.sortBy(r => (r.user, r.item))
+        ratings foreach {
           rating => {
-            val (pi, omegai) = userMap(rating.user)
-            val (qj, omegaj) = itemMap(rating.item)
+            val Factor(pId, pi, omegai) = users(rating.userIdx)
+            val Factor(qId, qj, omegaj) = items(rating.itemIdx)
 
             val rij = rating.rating
 
@@ -594,18 +616,20 @@ object SGD {
             val newQj = pi.zip(qj).map { case (p, q) =>
               q - effectiveLearningRate * (lambda / omegaj * q - piqj * p) }
 
-            userMap.update(rating.user, (newPi, omegai))
-            itemMap.update(rating.item, (newQj, omegaj))
+            users(rating.userIdx) = Factor(pId, newPi, omegai)
+            users(rating.itemIdx) = Factor(qId, newQj, omegaj)
+//            userMap.update(rating.user, (newPi, omegai))
+//            itemMap.update(rating.item, (newQj, omegaj))
           }
         }
 
-        val userResult = userMap.map { case (id, (fact, omega)) =>
-          Factor(id, fact, omega) }.toSeq
-        val itemResult = itemMap.map { case (id, (fact, omega)) =>
-          Factor(id, fact, omega) }.toSeq
+//        val userResult = userMap.map { case (id, (fact, omega)) =>
+//          Factor(id, fact, omega) }.toSeq
+//        val itemResult = itemMap.map { case (id, (fact, omega)) =>
+//          Factor(id, fact, omega) }.toSeq
 
         val (newP, newQ) = nextGroup(group, numBlocks)
-        (FactorBlock(newP, true, userResult), FactorBlock(newQ, false, itemResult))
+        (FactorBlock(newP, isUser = true, users), FactorBlock(newQ, isUser = false, items))
       }
     }
     ).setParallelism(numBlocks)
