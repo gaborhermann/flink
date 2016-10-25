@@ -18,8 +18,10 @@
 
 package org.apache.flink.ml.recommendation
 
+import java.lang.Iterable
+
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
-import org.apache.flink.api.common.functions.RichMapFunction
+import org.apache.flink.api.common.functions.{RichCoGroupFunction, RichMapFunction}
 import org.apache.flink.api.common.operators.base.JoinOperatorBase.JoinHint
 import org.apache.flink.api.scala._
 import org.apache.flink.configuration.Configuration
@@ -31,6 +33,7 @@ import org.apache.flink.util.Collector
 
 import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
+import scala.collection.JavaConverters._
 
 /** Alternating least squares algorithm to calculate a matrix factorization.
   *
@@ -509,20 +512,21 @@ object SGD {
           lambda, numBlocks, seed)
       }
 
+      // fixme: if commented it runs significantly slower: 2.5 sec vs 3.7 sec for 1000 iter on test
       // TODO: REMOVE FROM FINAL VERSION
-      userItem.writeAsCsv("/home/ghermann/tmp/useritem_final.csv",
-        writeMode =FileSystem.WriteMode.OVERWRITE).setParallelism(1)
-      userItem.getExecutionEnvironment.execute()
+//      userItem.writeAsCsv("/home/ghermann/tmp/useritem_final.csv",
+//        writeMode =FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+//      userItem.getExecutionEnvironment.execute()
       // END OF TODO
 
       val users = unblock(userItem, userUnblockInfo, isUser = true)
       val items = unblock(userItem, itemUnblockInfo, isUser = false)
 
       // TODO: REMOVE FROM FINAL VERSION
-      users.writeAsCsv("/home/ghermann/tmp/users_final.csv",
-        writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
-      items.writeAsCsv("/home/ghermann/tmp/items_final.csv",
-        writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+//      users.writeAsCsv("/home/ghermann/tmp/users_final.csv",
+//        writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
+//      items.writeAsCsv("/home/ghermann/tmp/items_final.csv",
+//        writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
       // END OF TODO
 
       instance.factorsOption = Some((users, items))
@@ -543,96 +547,115 @@ object SGD {
                     numBlocks: Int,
                     seed: Long): DataSet[FactorBlock] = {
 
-    def extractUserItemBlock(factorBlocks: Iterator[FactorBlock]): (FactorBlock, FactorBlock) = {
+    def updateLocalFactors(ratingBlock: RatingBlock,
+                           userBlock: FactorBlock,
+                           itemBlock: FactorBlock,
+                           iteration: Int): (FactorBlock, FactorBlock) = {
+
+      val effectiveLearningRate = learningRateMethod.calculateLearningRate(
+        learningRate,
+        iteration + 1,
+        lambda)
+
+      val RatingBlock(ratingBlockId, ratings) = ratingBlock
+      val FactorBlock(userBlockId, _, _, users, userOmegas) = userBlock
+      val FactorBlock(itemBlockId, _, _, items, itemOmegas) = itemBlock
+
+      val random = new Random(iteration ^ ratingBlockId ^ seed)
+      val shuffleIdxs = random.shuffle[Int, IndexedSeq](ratings.indices)
+
+      shuffleIdxs.map(ratingIdx => ratings(ratingIdx)) foreach {
+        rating => {
+          val pi = users(rating.userIdx)
+          val omegai = userOmegas(rating.userIdx)
+
+          val qj = items(rating.itemIdx)
+          val omegaj = itemOmegas(rating.itemIdx)
+
+          val rij = rating.rating
+
+          val piqj = rij - blas.ddot(pi.length, pi, 1, qj, 1)
+
+          val newPi = pi.zip(qj).map { case (p, q) =>
+            p - effectiveLearningRate * (lambda / omegai * p - piqj * q) }
+          val newQj = pi.zip(qj).map { case (p, q) =>
+            q - effectiveLearningRate * (lambda / omegaj * q - piqj * p) }
+
+          users(rating.userIdx) = newPi
+          items(rating.itemIdx) = newQj
+        }
+      }
+
+      (userBlock.copy(factors = users), itemBlock.copy(factors = items))
+    }
+
+    def extractUserItemBlock(factorBlocks: Iterator[FactorBlock]):
+      (Option[FactorBlock], Option[FactorBlock], RatingBlockId) = {
       val b1 = factorBlocks.next()
-      val b2 = factorBlocks.next()
+      val b2 = factorBlocks.toIterable.headOption
 
       if (b1.isUser) {
-        (b1, b2)
+        (Some(b1), b2, b1.currentRatingBlock)
       } else {
-        (b2, b1)
+        (b2, Some(b1), b1.currentRatingBlock)
       }
     }
 
-    val grouped =
-      // todo coGroup does an outer join, we need an inner join, eliminate coGroup
-      userItem.coGroup(ratingBlocks)
-        .where(factorBlock => factorBlock.currentRatingBlock)
-        .equalTo(ratingBlock => ratingBlock.id).apply {
-        (factorBlocks: Iterator[FactorBlock], ratingBlock: Iterator[RatingBlock],
-         out: Collector[(RatingBlock, FactorBlock, FactorBlock)]) =>
-          if (factorBlocks.hasNext && ratingBlock.hasNext) {
+    // todo Consider left outer join.
+    //   - pros
+    //      . it would eliminate rating block check (no need to "invoke" unused rating block)
+    //      . flexible underlying implementation (shipping/local strategy)
+    //   - cons
+    //      . has to aggregate the two factor blocks in the join function
+    userItem.coGroup(ratingBlocks)
+      .where(factorBlock => factorBlock.currentRatingBlock)
+      .equalTo(ratingBlock => ratingBlock.id).apply(
+      new RichCoGroupFunction[FactorBlock, RatingBlock, FactorBlock] {
+
+        override def coGroup(factorBlocksJava: Iterable[FactorBlock],
+                             ratingBlocksJava: Iterable[RatingBlock],
+                             out: Collector[FactorBlock]): Unit = {
+
+          val factorBlocks = factorBlocksJava.asScala.iterator
+          val ratingBlocks = ratingBlocksJava.asScala.iterator
+
+          // We only need to update factors by the current rating block
+          // if there are factors matched to that rating block.
+          if (factorBlocks.hasNext) {
             // There are factors matched to the current rating block,
             // so we are updating those factors by the current rating block.
-            // We could eliminate this check with an inner join.
 
-            // there are two factor blocks, one user and one item
-            val (userBlock, itemBlock) = extractUserItemBlock(factorBlocks)
-            // there is one rating block
-            out.collect((ratingBlock.next(), userBlock, itemBlock))
-          } else {
-            // TODO cleanup
-//            println(s"No factor blocks (${!factorBlocks.hasNext})" +
-//              s"or no rating block (${!ratingBlock.hasNext})")
-          }
-      }
+            // There are two factor blocks, one user and one item.
+            // One of them might be missing when there is no rating block,
+            // so we use options.
+            val (userBlock, itemBlock, currentRatingBlock) = extractUserItemBlock(factorBlocks)
 
-    val pr = grouped.map(
-      new RichMapFunction[(SGD.RatingBlock, FactorBlock, FactorBlock),
-        (FactorBlock, FactorBlock)] {
+            val (updatedUserBlock, updatedItemBlock) =
+              if (ratingBlocks.hasNext) {
+                // there is one rating block
+                val ratingBlock = ratingBlocks.next()
 
-      override def map(row: (RatingBlock, FactorBlock, FactorBlock)):
-      (FactorBlock, FactorBlock) = {
-        val iteration = getIterationRuntimeContext.getSuperstepNumber / numBlocks
+                val currentIteration = getIterationRuntimeContext.getSuperstepNumber / numBlocks
 
-        val effectiveLearningRate = learningRateMethod.calculateLearningRate(
-          learningRate,
-          iteration + 1,
-          lambda)
+                val (userB, itemB) =
+                  updateLocalFactors(ratingBlock, userBlock.get, itemBlock.get, currentIteration)
 
-        val (
-          RatingBlock(ratingBlockId, ratings),
-          FactorBlock(userBlockId, _, _, users, userOmegas),
-          FactorBlock(itemBlockId, _, _, items, itemOmegas)
-          ) = row
+                (Some(userB), Some(itemB))
+              } else {
+                // There are no ratings in the current block, so we do not update the factors,
+                // just pass them forward.
 
-        val random = new Random(iteration ^ ratingBlockId ^ seed)
-        val shuffleIdxs = random.shuffle[Int, IndexedSeq](ratings.indices)
+                (userBlock, itemBlock)
+              }
 
-        shuffleIdxs.map(ratingIdx => ratings(ratingIdx)) foreach {
-          rating => {
-            val pi = users(rating.userIdx)
-            val omegai = userOmegas(rating.userIdx)
+            // calculating the next rating block for the factor blocks
+            val (newP, newQ) = nextRatingBlock(currentRatingBlock, numBlocks)
 
-            val qj = items(rating.itemIdx)
-            val omegaj = itemOmegas(rating.itemIdx)
-
-            val rij = rating.rating
-
-            val piqj = rij - blas.ddot(pi.length, pi, 1, qj, 1)
-
-            val newPi = pi.zip(qj).map { case (p, q) =>
-              p - effectiveLearningRate * (lambda / omegai * p - piqj * q) }
-            val newQj = pi.zip(qj).map { case (p, q) =>
-              q - effectiveLearningRate * (lambda / omegaj * q - piqj * p) }
-
-            users(rating.userIdx) = newPi
-            items(rating.itemIdx) = newQj
+            updatedUserBlock.foreach(x => out.collect(x.copy(currentRatingBlock = newP)))
+            updatedItemBlock.foreach(x => out.collect(x.copy(currentRatingBlock = newQ)))
           }
         }
-
-        val (newP, newQ) = nextGroup(ratingBlockId, numBlocks)
-        (FactorBlock(userBlockId, newP, isUser = true, users, userOmegas),
-          FactorBlock(itemBlockId, newQ, isUser = false, items, itemOmegas))
-      }
-    }
-    ).setParallelism(numBlocks)
-
-    pr.flatMap { (a, col: Collector[FactorBlock]) => {
-      col.collect(a._1)
-      col.collect(a._2)
-    }
-    }
+      })
   }
 
   // ================================ Math helper functions ========================================
@@ -645,8 +668,8 @@ object SGD {
     * @param numFactorBlocks
     * @return
     */
-  def nextGroup(currentRatingBlock: RatingBlockId,
-                numFactorBlocks: Int): (RatingBlockId, RatingBlockId) = {
+  def nextRatingBlock(currentRatingBlock: RatingBlockId,
+                      numFactorBlocks: Int): (RatingBlockId, RatingBlockId) = {
     val pRow = currentRatingBlock / numFactorBlocks
     val qRow = currentRatingBlock % numFactorBlocks
 
