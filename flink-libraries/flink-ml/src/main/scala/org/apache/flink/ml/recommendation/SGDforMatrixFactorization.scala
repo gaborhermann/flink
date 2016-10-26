@@ -21,21 +21,19 @@ package org.apache.flink.ml.recommendation
 import java.lang.Iterable
 
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
-import org.apache.flink.api.common.functions.{RichCoGroupFunction, RichMapFunction}
-import org.apache.flink.api.common.operators.base.JoinOperatorBase.JoinHint
+import org.apache.flink.api.common.functions.RichCoGroupFunction
 import org.apache.flink.api.scala._
-import org.apache.flink.configuration.Configuration
-import org.apache.flink.core.fs.FileSystem
 import org.apache.flink.ml.common._
 import org.apache.flink.ml.optimization.LearningRateMethod.{Default, LearningRateMethodTrait}
-import org.apache.flink.ml.pipeline.{FitOperation, PredictDataSetOperation, Predictor}
+import org.apache.flink.ml.pipeline.FitOperation
 import org.apache.flink.util.Collector
 
-import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
 import scala.collection.JavaConverters._
 
 /** Alternating least squares algorithm to calculate a matrix factorization.
+  *
+  *  todo describe algorithm properly
   *
   * Given a matrix `R`, SGD calculates two matrices `U` and `V` such that `R ~~ U^TV`. The
   * unknown row dimension is given by the number of latent factors. Since matrix factorization
@@ -62,6 +60,8 @@ import scala.collection.JavaConverters._
   * The matrix `R` is given in its sparse representation as a tuple of `(i, j, r)` where `i` is the
   * row index, `j` is the column index and `r` is the matrix value at position `(i,j)`.
   *
+  * todo refine example
+  *
   * @example
   *          {{{
   *             val inputDS: DataSet[(Int, Int, Double)] = env.readCsvFile[(Int, Int, Double)](
@@ -80,212 +80,56 @@ import scala.collection.JavaConverters._
   *
   * =Parameters=
   *
-  *  - [[org.apache.flink.ml.recommendation.SGD.NumFactors]]:
+  *  - [[org.apache.flink.ml.recommendation.MatrixFactorization.NumFactors]]:
   *  The number of latent factors. It is the dimension of the calculated user and item vectors.
   *  (Default value: '''10''')
   *
-  *  - [[org.apache.flink.ml.recommendation.SGD.Lambda]]:
+  *  - [[org.apache.flink.ml.recommendation.MatrixFactorization.Lambda]]:
   *  Regularization factor. Tune this value in order to avoid overfitting/generalization.
   *  (Default value: '''1''')
   *
   *  - [[org.apache.flink.ml.regression.MultipleLinearRegression.Iterations]]:
   *  The number of iterations to perform. (Default value: '''10''')
   *
-  *  - [[org.apache.flink.ml.recommendation.SGD.Blocks]]:
+  *  - [[org.apache.flink.ml.recommendation.MatrixFactorization.Blocks]]:
   *  The number of blocks into which the user and item matrix a grouped. The fewer
   *  blocks one uses, the less data is sent redundantly. However, bigger blocks entail bigger
   *  update messages which have to be stored on the Heap. If the algorithm fails because of
   *  an OutOfMemoryException, then try to increase the number of blocks. (Default value: '''None''')
   *
-  *  - [[org.apache.flink.ml.recommendation.SGD.Seed]]:
+  *  - [[org.apache.flink.ml.recommendation.MatrixFactorization.Seed]]:
   *  Random seed used to generate the initial item matrix for the algorithm.
   *  (Default value: '''0''')
   *
-  *  - [[org.apache.flink.ml.recommendation.SGD.TemporaryPath]]:
-  *  Path to a temporary directory into which intermediate results are stored. If
-  *  this value is set, then the algorithm is split into two preprocessing steps, the SGD iteration
-  *  and a post-processing step which calculates a last SGD half-step.
-  *  The result of the individual steps are stored in the specified directory. By splitting the
-  *  algorithm into multiple smaller steps, Flink does not have to split the available memory
-  *  amongst too many operators. This allows the system to process bigger individual messasges and
-  *  improves the overall performance. (Default value: '''None''')
-  *
+  *  todo other parameters
   */
-class SGD extends Predictor[SGD] {
+class SGDforMatrixFactorization extends MatrixFactorization[SGDforMatrixFactorization] {
 
-  import SGD._
+  import SGDforMatrixFactorization._
 
-  // Stores the matrix factorization after the fitting phase
-  var factorsOption: Option[(DataSet[Factor], DataSet[Factor])] = None
-
-  /** Sets the number of latent factors/row dimension of the latent model
-    *
-    * @param numFactors
-    * @return
-    */
-  def setNumFactors(numFactors: Int): SGD = {
-    parameters.add(NumFactors, numFactors)
-    this
-  }
-
-  /** Sets the regularization coefficient lambda
-    *
-    * @param lambda
-    * @return
-    */
-  def setLambda(lambda: Double): SGD = {
-    parameters.add(Lambda, lambda)
-    this
-  }
-
-  /** Sets the number of iterations of the SGD algorithm
-    *
-    * @param iterations
-    * @return
-    */
-  def setIterations(iterations: Int): SGD = {
-    parameters.add(Iterations, iterations)
-    this
-  }
-
-  /** Sets the number of blocks into which the user and item matrix shall be partitioned
-    *
-    * @param blocks
-    * @return
-    */
-  def setBlocks(blocks: Int): SGD = {
-    parameters.add(Blocks, blocks)
-    this
-  }
-
-  /** Sets the random seed for the initial item matrix initialization
-    *
-    * @param seed
-    * @return
-    */
-  def setSeed(seed: Long): SGD = {
-    parameters.add(Seed, seed)
-    this
-  }
-
-  /** Sets the temporary path into which intermediate results are written in order to increase
-    * performance.
-    *
-    * @param temporaryPath
-    * @return
-    */
-  def setTemporaryPath(temporaryPath: String): SGD = {
-    parameters.add(TemporaryPath, temporaryPath)
-    this
-  }
-
-  /** Sets the learning rate for the algorithm
+  /** Sets the learning rate for the algorithm.
     *
     * @param learningRate
     * @return
     */
-  def setLearningRate(learningRate: Double): SGD = {
+  def setLearningRate(learningRate: Double): SGDforMatrixFactorization = {
     parameters.add(LearningRate, learningRate)
     this
   }
 
-  /** Empirical risk of the trained model (matrix factorization).
-    *
-    * @param labeledData Reference data
-    * @param riskParameters Additional parameters for the empirical risk calculation
-    * @return
-    */
-  def empiricalRisk(
-                     labeledData: DataSet[(Int, Int, Double)],
-                     riskParameters: ParameterMap = ParameterMap.Empty)
-  : DataSet[Double] = {
-    val resultingParameters = parameters ++ riskParameters
-
-    val lambda = resultingParameters(Lambda)
-
-    val data = labeledData map {
-      x => (x._1, x._2)
-    }
-
-    factorsOption match {
-      case Some((userFactors, itemFactors)) => {
-        val predictions = data.join(userFactors, JoinHint.REPARTITION_HASH_SECOND).where(0)
-          .equalTo(0).join(itemFactors, JoinHint.REPARTITION_HASH_SECOND).where("_1._2")
-          .equalTo(0).map {
-          triple => {
-            val (((uID, iID), uFactors), iFactors) = triple
-
-            val uFactorsVector = uFactors.factors
-            val iFactorsVector = iFactors.factors
-
-            val squaredUNorm2 = blas.ddot(
-              uFactorsVector.length,
-              uFactorsVector,
-              1,
-              uFactorsVector,
-              1)
-            val squaredINorm2 = blas.ddot(
-              iFactorsVector.length,
-              iFactorsVector,
-              1,
-              iFactorsVector,
-              1)
-
-            val prediction = blas.ddot(uFactorsVector.length, uFactorsVector, 1, iFactorsVector, 1)
-
-            (uID, iID, prediction, squaredUNorm2, squaredINorm2)
-          }
-        }
-
-        labeledData.join(predictions).where(0, 1).equalTo(0, 1) {
-          (left, right) => {
-            val (_, _, expected) = left
-            val (_, _, predicted, squaredUNorm2, squaredINorm2) = right
-
-            val residual = expected - predicted
-
-            residual * residual + lambda * (squaredUNorm2 + squaredINorm2)
-          }
-        } reduce {
-          _ + _
-        }
-      }
-
-      case None => throw new RuntimeException("The SGD model has not been fitted to data. " +
-        "Prior to predicting values, it has to be trained on data.")
-    }
+  // todo scala docs
+  def setLearningRateMethod(learningRateMethod: LearningRateMethodTrait):
+  SGDforMatrixFactorization = {
+    parameters.add(LearningRateMethod, learningRateMethod)
+    this
   }
 }
 
-object SGD {
-  val USER_FACTORS_FILE = "userFactorsFile"
-  val ITEM_FACTORS_FILE = "itemFactorsFile"
+object SGDforMatrixFactorization {
+
+  import MatrixFactorization._
 
   // ========================================= Parameters ==========================================
-
-  case object NumFactors extends Parameter[Int] {
-    val defaultValue: Option[Int] = Some(10)
-  }
-
-  case object Lambda extends Parameter[Double] {
-    val defaultValue: Option[Double] = Some(1.0)
-  }
-
-  case object Iterations extends Parameter[Int] {
-    val defaultValue: Option[Int] = Some(10)
-  }
-
-  case object Blocks extends Parameter[Int] {
-    val defaultValue: Option[Int] = None
-  }
-
-  case object Seed extends Parameter[Long] {
-    val defaultValue: Option[Long] = Some(0L)
-  }
-
-  case object TemporaryPath extends Parameter[String] {
-    val defaultValue: Option[String] = None
-  }
 
   case object LearningRate extends Parameter[Double] {
     val defaultValue: Option[Double] = Some(1.0)
@@ -297,161 +141,87 @@ object SGD {
 
   // ==================================== SGD type definitions =====================================
 
+  /**
+    * Index of a factor in a factor block.
+    */
   type IndexInFactorBlock = Int
 
-  /** Representation of a user-item rating
+  /**
+    * Representation of a rating in a rating block.
     *
-    * @param user User ID of the rating user
-    * @param item Item iD of the rated item
-    * @param rating Rating value
+    * @param rating Value of rating.
+    * @param userIdx Index of user vector in the corresponding user block.
+    * @param itemIdx Index of item vector in the corresponding item block.
     */
   case class RatingInfo(rating: Double,
                         userIdx: IndexInFactorBlock,
                         itemIdx: IndexInFactorBlock)
 
-  /** Latent factor model vector
-    *
-    * @param id
-    * @param factors
+  /**
+    * Rating block identifier.
     */
-  case class Factor(id: Int, factors: Array[Double])
-    extends Serializable
-
   type RatingBlockId = Int
+
+  /**
+    * Factor block identifier.
+    */
+  type FactorBlockId = Int
+
+  /**
+    * Representation of a rating block.
+    *
+    * @param id Identifier of the block.
+    * @param block Array containing the ratings corresponding to the block.
+    */
   case class RatingBlock(id: RatingBlockId, block: Array[RatingInfo])
 
-  type FactorBlockId = Int
-  // todo sealed trait + user,item class
+  /**
+    * Representation of a factor block.
+    *
+    * @param factorBlockId Identifier of the block.
+    * @param currentRatingBlock Id of the rating block with which we are currently computing the
+    *                           gradients
+    * @param isUser Boolean marking whether it's a user or item block.
+    * @param factors Array containing the vectors corresponding to the block.
+    * @param omegas Array containing the omegas for every factor,
+    *               i.e. the number of occurrences of that factor in the ratings.
+    */
   case class FactorBlock(factorBlockId: FactorBlockId,
                          currentRatingBlock: RatingBlockId,
                          isUser: Boolean,
                          factors: Array[Array[Double]],
-                         omegas: Array[Int]) {
-    override def toString: String = {
-      s"${if (isUser) "user" else "item" } #$factorBlockId -> ${factors.toSeq}"
-    }
-  }
+                         omegas: Array[Int])
 
+  /**
+    * Information for unblocking the factors at the end of the algorithm.
+    *
+    * @param factorBlockId Id of the factor block.
+    * @param factorIds Ids of the factors in the corresponding factor block.
+    */
   case class UnblockInformation(factorBlockId: FactorBlockId, factorIds: Array[Int])
-
-  def toRatingBlockId(userBlockId: FactorBlockId,
-                      itemBlockId: FactorBlockId,
-                      numOfBlocks: Int): RatingBlockId = {
-    userBlockId * numOfBlocks + itemBlockId
-  }
-
-  case class Factorization(userFactors: DataSet[Factor], itemFactors: DataSet[Factor])
 
   // ================================= Factory methods =============================================
 
-  def apply(): SGD = {
-    new SGD()
+  def apply(): SGDforMatrixFactorization = {
+    new SGDforMatrixFactorization()
   }
 
   // ===================================== Operations ==============================================
 
-  /** Predict operation which calculates the matrix entry for the given indices  */
-  implicit val predictRating = new PredictDataSetOperation[SGD, (Int, Int), (Int, Int, Double)] {
-    override def predictDataSet(
-                                 instance: SGD,
-                                 predictParameters: ParameterMap,
-                                 input: DataSet[(Int, Int)])
-    : DataSet[(Int, Int, Double)] = {
-
-      instance.factorsOption match {
-        case Some((userFactors, itemFactors)) => {
-          input.join(userFactors, JoinHint.REPARTITION_HASH_SECOND).where(0).equalTo(i => i.id)
-            .join(itemFactors, JoinHint.REPARTITION_HASH_SECOND).where("_1._2").equalTo(i => i.id)
-            .map {
-              triple => {
-                val (((uID, iID), uFactors), iFactors) = triple
-
-                val uFactorsVector = uFactors.factors
-                val iFactorsVector = iFactors.factors
-
-                val prediction = blas.ddot(
-                  uFactorsVector.length,
-                  uFactorsVector,
-                  1,
-                  iFactorsVector,
-                  1)
-
-                (uID, iID, prediction)
-              }
-            }
-        }
-
-        case None => throw new RuntimeException("The SGD model has not been fitted to data. " +
-          "Prior to predicting values, it has to be trained on data.")
-      }
-    }
-  }
-
-  def initFactorBlockAndIndices(factorIdsForRatings: DataSet[Int],
-                                isUser: Boolean,
-                                numBlocks: Int,
-                                seed: Long,
-                                factors: Int):
-  (DataSet[FactorBlock], DataSet[(Int, Int, FactorBlockId)], DataSet[UnblockInformation]) = {
-
-    val factorIDs = factorIdsForRatings.distinct()
-
-    val factorBlockIds: DataSet[(Int, FactorBlockId)] = factorIDs.map(id =>
-      (id, new Random(id ^ seed).nextInt(numBlocks))
-    )
-
-    val factorCounts = factorIdsForRatings.map((_, 1)).groupBy(0).sum(1)
-
-    val initialFactorBlocks =
-      factorBlockIds
-        .join(factorCounts).where(0).equalTo(0)
-        .map(_ match {
-          case ((id, factorBlockId), (_, count)) =>
-            val random = new Random(id ^ seed)
-            (factorBlockId, Factor(id, ALS.randomFactors(factors, random)), count)
-        })
-        .groupBy(0).reduceGroup {
-        users => {
-          val arr = users.toArray
-          val factors = arr.map(_._2)
-          val omegas = arr.map(_._3)
-          val factorBlockId = arr(0)._1
-          val initialRatingBlock = factorBlockId * (numBlocks + 1)
-
-          val factorIds = factors.map(_.id)
-
-          (FactorBlock(factorBlockId, initialRatingBlock, isUser, factors.map(_.factors), omegas),
-            factorIds)
-        }
-      }
-
-    val factorIdxInBlock = initialFactorBlocks
-      .map(x => (x._1.factorBlockId, x._2))
-      .flatMap {
-        _ match {
-          case (factorBlockId, ids) =>
-            ids.zipWithIndex.map {
-              case (id, idx) =>
-                (id, idx, factorBlockId)
-            }
-        }
-      }
-
-    val unblockInfo = initialFactorBlocks
-      .map(x => UnblockInformation(x._1.factorBlockId, x._2))
-
-    (initialFactorBlocks.map(_._1), factorIdxInBlock, unblockInfo)
-  }
-
+  /**
+    * Unblocks the factors (either user or item).
+    *
+    * @return [[DataSet]] containing the factors.
+    */
   def unblock(factorBlocks: DataSet[FactorBlock],
               unblockInfo: DataSet[UnblockInformation],
-              isUser: Boolean): DataSet[Factor] = {
+              isUser: Boolean): DataSet[Factors] = {
     factorBlocks
       .filter(i => i.isUser == isUser)
       .join(unblockInfo).where(_.factorBlockId).equalTo(_.factorBlockId)
       .flatMap(x => x match {
         case (FactorBlock(_, _, _, factorsInBlock, _), UnblockInformation(_, ids)) =>
-          ids.zip(factorsInBlock).map(x => Factor(x._1, x._2))
+          ids.zip(factorsInBlock).map(x => Factors(x._1, x._2))
       })
   }
 
@@ -460,16 +230,15 @@ object SGD {
     *
     * @return Factorization containing the user and item matrix
     */
-  implicit val fitSGD = new FitOperation[SGD, (Int, Int, Double)] {
+  implicit val fitSGD = new FitOperation[SGDforMatrixFactorization, (Int, Int, Double)] {
     override def fit(
-                      instance: SGD,
+                      instance: SGDforMatrixFactorization,
                       fitParameters: ParameterMap,
                       input: DataSet[(Int, Int, Double)])
     : Unit = {
       val resultParameters = instance.parameters ++ fitParameters
 
       val numBlocks = resultParameters.get(Blocks).getOrElse(1)
-      val persistencePath = resultParameters.get(TemporaryPath)
       val seed = resultParameters(Seed)
       val factors = resultParameters(NumFactors)
       val iterations = resultParameters(Iterations)
@@ -479,15 +248,23 @@ object SGD {
 
       val ratings = input
 
+      // Initializing user and item blocks.
+      // We keep information about indices in the blocks so we can construct rating blocks
+      // without having to refer to the user or item ids directly. This way we don't have to use
+      // these ids during the iteration. Thus, for doing the unblocking at the end,
+      // we need to store information about the user and item ids.
       val (initialUserBlocks, userIdxInBlock, userUnblockInfo) =
         initFactorBlockAndIndices(ratings.map(_._1), isUser = true, numBlocks, seed, factors)
       val (initialItemBlocks, itemIdxInBlock, itemUnblockInfo) =
         initFactorBlockAndIndices(ratings.map(_._2), isUser = false, numBlocks, seed, factors)
 
+      // Constructing the rating blocks. There are numBlocks * numBlocks rating blocks.
       // todo maybe optimize 3-way join
       val ratingBlocks = ratings
         .join(userIdxInBlock).where(_._1).equalTo(0)
         .join(itemIdxInBlock).where(_._1._2).equalTo(0)
+        // matching the indices in the factor blocks (user and item) with the ratings
+        // and creating rating block ids
         .map(_ match {
           case (((user, item, rating), (_, userIdx, userBlockId)), (_, itemIdx, itemBlockId)) =>
             (toRatingBlockId(userBlockId, itemBlockId, numBlocks),
@@ -495,6 +272,7 @@ object SGD {
               // todo eliminate this last item, only needed for deterministic result
               (user, item))
         })
+        // grouping by the rating block ids and constructing rating blocks
         .groupBy(0)
         .reduceGroup {
           ratings =>
@@ -505,29 +283,20 @@ object SGD {
             RatingBlock(ratingBlockId, ratingInfos)
         }
 
+      // We union the user and item blocks so that we can use them as one [[DataSet]]
+      // in the iteration.
       val initUserItem = initialUserBlocks.union(initialItemBlocks)
 
+      // Iteratively updating the factors. We sweep through numBlocks rating blocks
+      // in one iteration, thus we sweep through the whole rating matrix in numBlocks iterations.
       val userItem = initUserItem.iterate(iterations * numBlocks) {
         ui => updateFactors(ui, ratingBlocks, learningRate, learningRateMethod,
           lambda, numBlocks, seed)
       }
 
-      // fixme: if commented it runs significantly slower: 2.5 sec vs 3.7 sec for 1000 iter on test
-      // TODO: REMOVE FROM FINAL VERSION
-//      userItem.writeAsCsv("/home/ghermann/tmp/useritem_final.csv",
-//        writeMode =FileSystem.WriteMode.OVERWRITE).setParallelism(1)
-//      userItem.getExecutionEnvironment.execute()
-      // END OF TODO
-
+      // unblocking the user and item matrices
       val users = unblock(userItem, userUnblockInfo, isUser = true)
       val items = unblock(userItem, itemUnblockInfo, isUser = false)
-
-      // TODO: REMOVE FROM FINAL VERSION
-//      users.writeAsCsv("/home/ghermann/tmp/users_final.csv",
-//        writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
-//      items.writeAsCsv("/home/ghermann/tmp/items_final.csv",
-//        writeMode = FileSystem.WriteMode.OVERWRITE).setParallelism(1)
-      // END OF TODO
 
       instance.factorsOption = Some((users, items))
     }
@@ -536,8 +305,7 @@ object SGD {
   /** Calculates a single sweep for the SGD optimization. The result is the new value for
     * the user and item matrix.
     *
-    * @param userItem Fixed matrix value for the half step
-    * @return New value for the optimized matrix (either user or item)
+    * @return New values for the optimized matrices.
     */
   def updateFactors(userItem: DataSet[FactorBlock],
                     ratingBlocks: DataSet[RatingBlock],
@@ -547,6 +315,12 @@ object SGD {
                     numBlocks: Int,
                     seed: Long): DataSet[FactorBlock] = {
 
+    /**
+      * Updates one user and item block based on one corresponding rating block.
+      * This is the local logic of the SGD.
+      *
+      * @return The updated user and item block.
+      */
     def updateLocalFactors(ratingBlock: RatingBlock,
                            userBlock: FactorBlock,
                            itemBlock: FactorBlock,
@@ -589,6 +363,15 @@ object SGD {
       (userBlock.copy(factors = users), itemBlock.copy(factors = items))
     }
 
+    /**
+      * Helper method for extracting the user and item block for a rating block.
+      *
+      * Because one of the two blocks might be missing, it returns [[Option]]s,
+      * and also the rating block id, so we even if we cannot update the factors in the block,
+      * we can update current rating block id in the factor blocks, preparing the next step.
+      *
+      * @return Optional user and item blocks and the current rating block id.
+      */
     def extractUserItemBlock(factorBlocks: Iterator[FactorBlock]):
       (Option[FactorBlock], Option[FactorBlock], RatingBlockId) = {
       val b1 = factorBlocks.next()
@@ -607,6 +390,7 @@ object SGD {
     //      . flexible underlying implementation (shipping/local strategy)
     //   - cons
     //      . has to aggregate the two factor blocks in the join function
+    // Matching the user and item blocks to the current rating block.
     userItem.coGroup(ratingBlocks)
       .where(factorBlock => factorBlock.currentRatingBlock)
       .equalTo(ratingBlock => ratingBlock.id).apply(
@@ -658,15 +442,96 @@ object SGD {
       })
   }
 
-  // ================================ Math helper functions ========================================
+  // ============================== Blocking helper functions ======================================
+
+  /**
+    * Initializes blocks for one factor matrix (either user or item).
+    *
+    * @param factorIdsForRatings [[DataSet]] containing the ids of the factors.
+    * @param isUser Indicates whether it's a user or item matrix.
+    * @param numBlocks Number of matrix blocks.
+    * @param seed Random seed
+    * @param factors Number of factors.
+    * @return Three [[DataSet]]s: the factor blocks,
+    *         the factor ids matched to their index in the factor block,
+    *         and the information for unblocking.
+    */
+  def initFactorBlockAndIndices(factorIdsForRatings: DataSet[Int],
+                                isUser: Boolean,
+                                numBlocks: Int,
+                                seed: Long,
+                                factors: Int):
+  (DataSet[FactorBlock], DataSet[(Int, Int, FactorBlockId)], DataSet[UnblockInformation]) = {
+
+    val factorIDs = factorIdsForRatings.distinct()
+
+    val factorBlockIds: DataSet[(Int, FactorBlockId)] = factorIDs.map(id =>
+      (id, new Random(id ^ seed).nextInt(numBlocks))
+    )
+
+    val factorCounts = factorIdsForRatings.map((_, 1)).groupBy(0).sum(1)
+
+    val initialFactorBlocks =
+      factorBlockIds
+        .join(factorCounts).where(0).equalTo(0)
+        .map(_ match {
+          case ((id, factorBlockId), (_, count)) =>
+            val random = new Random(id ^ seed)
+            (factorBlockId, Factors(id, randomFactors(factors, random)), count)
+        })
+        .groupBy(0).reduceGroup {
+        users => {
+          val arr = users.toArray
+          val factors = arr.map(_._2)
+          val omegas = arr.map(_._3)
+          val factorBlockId = arr(0)._1
+          val initialRatingBlock = factorBlockId * (numBlocks + 1)
+
+          val factorIds = factors.map(_.id)
+
+          (FactorBlock(factorBlockId, initialRatingBlock, isUser, factors.map(_.factors), omegas),
+            factorIds)
+        }
+      }
+
+    val factorIdxInBlock = initialFactorBlocks
+      .map(x => (x._1.factorBlockId, x._2))
+      .flatMap {
+        _ match {
+          case (factorBlockId, ids) =>
+            ids.zipWithIndex.map {
+              case (id, idx) =>
+                (id, idx, factorBlockId)
+            }
+        }
+      }
+
+    val unblockInfo = initialFactorBlocks
+      .map(x => UnblockInformation(x._1.factorBlockId, x._2))
+
+    (initialFactorBlocks.map(_._1), factorIdxInBlock, unblockInfo)
+  }
+
+  // ================ Helper functions for matching rating and factor blocks =======================
+
+  /**
+    * Logic that calculates the rating block id based on the user and item block ids.
+    *
+    * @return Rating block id.
+    */
+  def toRatingBlockId(userBlockId: FactorBlockId,
+                      itemBlockId: FactorBlockId,
+                      numOfBlocks: Int): RatingBlockId = {
+    userBlockId * numOfBlocks + itemBlockId
+  }
 
   /**
     * Logic that creates the rating block id for the next iteration step,
     * returning the next rating block ids for the current user factor block and item factor block.
     *
-    * @param currentRatingBlock
-    * @param numFactorBlocks
-    * @return
+    * @param currentRatingBlock Current rating block id.
+    * @param numFactorBlocks Number of factor blocks.
+    * @return The next rating block id for the user and item blocks.
     */
   def nextRatingBlock(currentRatingBlock: RatingBlockId,
                       numFactorBlocks: Int): (RatingBlockId, RatingBlockId) = {

@@ -25,7 +25,7 @@ import scala.language.postfixOps
 
 import org.apache.flink.api.scala._
 
-class SGDITSuite
+class SGDforMatrixFactorizationTest
   extends FlatSpec
     with Matchers
     with FlinkTestBase {
@@ -35,7 +35,7 @@ class SGDITSuite
   behavior of "The distributed stochastic gradient descent (DSGD) implementation" +
     " for matrix factorization."
 
-  it should "properly factorize a matrix" in {
+  it should "handle empty blocks" in {
     import Recommendation._
 
     val env = ExecutionEnvironment.getExecutionEnvironment
@@ -43,7 +43,7 @@ class SGDITSuite
     val dsgd = SGDforMatrixFactorization()
       .setIterations(iterations)
       .setLambda(lambda)
-      .setBlocks(3)
+      .setBlocks(100)
       .setNumFactors(numFactors)
       .setLearningRate(0.001)
       .setSeed(43L)
@@ -56,25 +56,18 @@ class SGDITSuite
       case (userID, itemID, rating) => (userID, itemID)
     })
 
+//        println(env.getExecutionPlan())
+//        println("------------------")
+    val startTime = System.currentTimeMillis()
     val predictions = dsgd.predict(testData).collect()
+    println(s"Runtime: ${System.currentTimeMillis() - startTime} ms")
 
-    val userFacts = dsgd.factorsOption.get._1.collect
-    val itemFacts = dsgd.factorsOption.get._2.collect
+//    val userFacts = dsgd.factorsOption.get._1.collect
+//    val itemFacts = dsgd.factorsOption.get._2.collect
+
     predictions.foreach(println)
     println("------------------")
 
     predictions.length should equal(expectedResultSGD.length)
-
-    val resultMap = expectedResultSGD map {
-      case (uID, iID, value) => (uID, iID) -> value
-    } toMap
-
-    predictions foreach {
-      case (uID, iID, value) => {
-        resultMap.isDefinedAt((uID, iID)) should be(true)
-
-        value should be(resultMap((uID, iID)) +- 0.1)
-      }
-    }
   }
 }
