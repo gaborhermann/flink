@@ -33,8 +33,6 @@ import scala.collection.JavaConverters._
 
 /** Alternating least squares algorithm to calculate a matrix factorization.
   *
-  *  todo describe algorithm properly
-  *
   * Given a matrix `R`, SGD calculates two matrices `U` and `V` such that `R ~~ U^TV`. The
   * unknown row dimension is given by the number of latent factors. Since matrix factorization
   * is often used in the context of recommendation, we'll call the first matrix the user and the
@@ -44,6 +42,7 @@ import scala.collection.JavaConverters._
   *
   * In order to find the user and item matrix, the following problem is solved:
   *
+  * todo what is the loss function?
   * `argmin_{U,V} sum_(i,j\ with\ r_{i,j} != 0) (r_{i,j} - u_{i}^Tv_{j})^2 +
   * lambda (sum_(i) n_{u_i} ||u_i||^2 + sum_(j) n_{v_j} ||v_j||^2)`
   *
@@ -52,30 +51,38 @@ import scala.collection.JavaConverters._
   * regularization scheme to avoid overfitting is called weighted-lambda-regularization. Details
   * can be found in the work of [[http://dx.doi.org/10.1007/978-3-540-68880-8_32 Zhou et al.]].
   *
-  * By fixing one of the matrices `U` or `V` one obtains a quadratic form which can be solved. The
-  * solution of the modified problem is guaranteed to decrease the overall cost function. By
-  * applying this step alternately to the matrices `U` and `V`, we can iteratively improve the
-  * matrix factorization.
+  * We randomly create user and item vectors, then randomly partition them into `k` user
+  * and `k` item blocks. Based on these factor blocks we partition the rating matrix to `k * k`
+  * blocks correspondingly.
+  *
+  * In one iteration step we choose `k` non-conflicting rating blocks, i.e. we should not choose
+  * two rating blocks simultaneously with the same user or item block. This is done by assigning
+  * a rating block ID to every user and item block. We match the user, item, and rating blocks by
+  * the current rating block ID, and update the user and item factors by the ratings locally.
+  * We also update the rating block ID for the factor blocks, thus in the next iteration we use
+  * other rating blocks to update the factors.
+  *
+  * In `k` iteration we sweep through the whole rating matrix of `k * k` blocks (so instead of
+  * the given number of iteration steps we do `k * numberOfIterationSteps` iterations).
   *
   * The matrix `R` is given in its sparse representation as a tuple of `(i, j, r)` where `i` is the
   * row index, `j` is the column index and `r` is the matrix value at position `(i,j)`.
-  *
-  * todo refine example
   *
   * @example
   *          {{{
   *             val inputDS: DataSet[(Int, Int, Double)] = env.readCsvFile[(Int, Int, Double)](
   *               pathToTrainingFile)
   *
-  *             val SGD = SGD()
+  *             val sgd = SGDForMatrixFactorization()
   *               .setIterations(10)
   *               .setNumFactors(10)
+  *               .setLearningRate(0.001)
   *
-  *             SGD.fit(inputDS)
+  *             sgd.fit(inputDS)
   *
   *             val data2Predict: DataSet[(Int, Int)] = env.readCsvFile[(Int, Int)](pathToData)
   *
-  *             SGD.predict(data2Predict)
+  *             sgd.predict(data2Predict)
   *          }}}
   *
   * =Parameters=
@@ -101,13 +108,21 @@ import scala.collection.JavaConverters._
   *  Random seed used to generate the initial item matrix for the algorithm.
   *  (Default value: '''0''')
   *
-  *  todo other parameters
+  *  - [[org.apache.flink.ml.recommendation.SGDforMatrixFactorization.LearningRate]]:
+  *  Initial learning rate, the weight with which we substract the gradient from the factors.
+  *  (Default value: '''0.001''')
+  *
+  *  - [[org.apache.flink.ml.recommendation.SGDforMatrixFactorization.LearningRateMethod]]:
+  *  Determines the functional form of the effective learning rate, i.e. the method for dynamically
+  *  changing the learning rate during the iterations. SGD can only reach convergence when the
+  *  learning rate is decreasing to zero.
+  *  (Default value: '''initialLearningRate / sqrt(currentIteration)''')
   */
 class SGDforMatrixFactorization extends MatrixFactorization[SGDforMatrixFactorization] {
 
   import SGDforMatrixFactorization._
 
-  /** Sets the learning rate for the algorithm.
+  /** Sets the initial learning rate for the algorithm.
     *
     * @param learningRate
     * @return
@@ -117,7 +132,11 @@ class SGDforMatrixFactorization extends MatrixFactorization[SGDforMatrixFactoriz
     this
   }
 
-  // todo scala docs
+  /** Sets the method for gradually decreasing the learning rate.
+    *
+    * @param learningRateMethod
+    * @return
+    */
   def setLearningRateMethod(learningRateMethod: LearningRateMethodTrait):
   SGDforMatrixFactorization = {
     parameters.add(LearningRateMethod, learningRateMethod)
@@ -132,7 +151,7 @@ object SGDforMatrixFactorization {
   // ========================================= Parameters ==========================================
 
   case object LearningRate extends Parameter[Double] {
-    val defaultValue: Option[Double] = Some(1.0)
+    val defaultValue: Option[Double] = Some(0.001)
   }
 
   case object LearningRateMethod extends Parameter[LearningRateMethodTrait] {
@@ -260,6 +279,7 @@ object SGDforMatrixFactorization {
 
       // Constructing the rating blocks. There are numBlocks * numBlocks rating blocks.
       // todo maybe optimize 3-way join
+      // todo is forwarded fields effective when using map instead of apply at the end of join?
       val ratingBlocks = ratings
         .join(userIdxInBlock).where(_._1).equalTo(0)
         .join(itemIdxInBlock).where(_._1._2).equalTo(0)
@@ -272,6 +292,8 @@ object SGDforMatrixFactorization {
               // todo eliminate this last item, only needed for deterministic result
               (user, item))
         })
+        .withForwardedFields("_1._2._2->_2.userIdx", "_2._2->_2.itemIdx", "_1._1._3->_2.rating",
+        "_1._1._1->_3._1", "_1._1._2->_3._2")
         // grouping by the rating block ids and constructing rating blocks
         .groupBy(0)
         .reduceGroup {
@@ -282,6 +304,7 @@ object SGDforMatrixFactorization {
             val ratingInfos = arr.map(_._2)
             RatingBlock(ratingBlockId, ratingInfos)
         }
+        .withForwardedFields("_1->id")
 
       // We union the user and item blocks so that we can use them as one [[DataSet]]
       // in the iteration.
@@ -332,8 +355,8 @@ object SGDforMatrixFactorization {
         lambda)
 
       val RatingBlock(ratingBlockId, ratings) = ratingBlock
-      val FactorBlock(userBlockId, _, _, users, userOmegas) = userBlock
-      val FactorBlock(itemBlockId, _, _, items, itemOmegas) = itemBlock
+      val FactorBlock(_, _, _, users, userOmegas) = userBlock
+      val FactorBlock(_, _, _, items, itemOmegas) = itemBlock
 
       val random = new Random(iteration ^ ratingBlockId ^ seed)
       val shuffleIdxs = random.shuffle[Int, IndexedSeq](ratings.indices)
@@ -439,7 +462,7 @@ object SGDforMatrixFactorization {
             updatedItemBlock.foreach(x => out.collect(x.copy(currentRatingBlock = newQ)))
           }
         }
-      })
+      }).withForwardedFieldsFirst("factorBlockId", "isUser", "omegas")
   }
 
   // ============================== Blocking helper functions ======================================
@@ -469,7 +492,11 @@ object SGDforMatrixFactorization {
       (id, new Random(id ^ seed).nextInt(numBlocks))
     )
 
-    val factorCounts = factorIdsForRatings.map((_, 1)).groupBy(0).sum(1)
+    val factorCounts = factorIdsForRatings
+      .map((_, 1))
+        .withForwardedFields("*->_1")
+      .groupBy(0)
+      .sum(1)
 
     val initialFactorBlocks =
       factorBlockIds
@@ -479,6 +506,7 @@ object SGDforMatrixFactorization {
             val random = new Random(id ^ seed)
             (factorBlockId, Factors(id, randomFactors(factors, random)), count)
         })
+        .withForwardedFields("_1._1->_2.id", "_1._2->_1", "_2._2->_3")
         .groupBy(0).reduceGroup {
         users => {
           val arr = users.toArray
@@ -492,24 +520,25 @@ object SGDforMatrixFactorization {
           (FactorBlock(factorBlockId, initialRatingBlock, isUser, factors.map(_.factors), omegas),
             factorIds)
         }
-      }
+      }.withForwardedFields("_1->_1.factorBlockId")
 
-    val factorIdxInBlock = initialFactorBlocks
-      .map(x => (x._1.factorBlockId, x._2))
+    val unblockInfo = initialFactorBlocks
+      .map(x => UnblockInformation(x._1.factorBlockId, x._2))
+      .withForwardedFields("_1.factorBlockId->factorBlockId", "_2->factorIds")
+
+    val factorIdxInBlock = unblockInfo
       .flatMap {
         _ match {
-          case (factorBlockId, ids) =>
+          case UnblockInformation(factorBlockId, ids) =>
             ids.zipWithIndex.map {
               case (id, idx) =>
                 (id, idx, factorBlockId)
             }
         }
       }
+      .withForwardedFields("factorBlockId->_3")
 
-    val unblockInfo = initialFactorBlocks
-      .map(x => UnblockInformation(x._1.factorBlockId, x._2))
-
-    (initialFactorBlocks.map(_._1), factorIdxInBlock, unblockInfo)
+    (initialFactorBlocks.map(_._1).withForwardedFields("_1->*"), factorIdxInBlock, unblockInfo)
   }
 
   // ================ Helper functions for matching rating and factor blocks =======================
