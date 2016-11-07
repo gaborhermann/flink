@@ -62,6 +62,16 @@ import scala.util.Random
   *  Random seed used when randomization is needed in the algorithm
   *  (e.g. when generating the initial user and item matrices).
   *  (Default value: '''0''')
+  *
+  *  - [[org.apache.flink.ml.recommendation.MatrixFactorization.TemporaryPath]]:
+  *  Path to a temporary directory into which intermediate results are stored. If
+  *  this value is set, then the algorithm is split into preprocessing steps, the iteration
+  *  and post-processing steps. The result of the individual steps are stored in the specified
+  *  directory. These steps differ at each iterative matrix factorization algorithm, but persisting
+  *  have the same purpose. By splitting the algorithm into multiple smaller steps, Flink does not
+  *  have to split the available memory amongst too many operators. This allows the system to
+  *  process bigger individual messages and improves the overall performance.
+  *  (Default value: '''None''')
   */
 trait MatrixFactorization[Self] extends Predictor[Self] {
   that: Self =>
@@ -118,6 +128,17 @@ trait MatrixFactorization[Self] extends Predictor[Self] {
     */
   def setSeed(seed: Long): Self = {
     parameters.add(Seed, seed)
+    this
+  }
+
+  /** Sets the temporary path into which intermediate results are written in order to increase
+    * performance.
+    *
+    * @param temporaryPath
+    * @return
+    */
+  def setTemporaryPath(temporaryPath: String): Self = {
+    parameters.add(TemporaryPath, temporaryPath)
     this
   }
 
@@ -214,6 +235,10 @@ object MatrixFactorization {
 
   case object Seed extends Parameter[Long] {
     val defaultValue: Option[Long] = Some(0L)
+  }
+
+  case object TemporaryPath extends Parameter[String] {
+    val defaultValue: Option[String] = None
   }
 
   // ============================ MatrixFactorization type definitions =============================

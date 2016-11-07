@@ -104,7 +104,7 @@ import scala.util.Random
   *  Random seed used to generate the initial item matrix for the algorithm.
   *  (Default value: '''0''')
   *
-  *  - [[org.apache.flink.ml.recommendation.ALS.TemporaryPath]]:
+  *  - [[org.apache.flink.ml.recommendation.MatrixFactorization.TemporaryPath]]:
   *  Path to a temporary directory into which intermediate results are stored. If
   *  this value is set, then the algorithm is split into two preprocessing steps, the ALS iteration
   *  and a post-processing step which calculates a last ALS half-step. The preprocessing steps
@@ -121,30 +121,11 @@ import scala.util.Random
   */
 class ALS extends MatrixFactorization[ALS] {
 
-  import ALS._
-
-  /** Sets the temporary path into which intermediate results are written in order to increase
-    * performance.
-    *
-    * @param temporaryPath
-    * @return
-    */
-  def setTemporaryPath(temporaryPath: String): ALS = {
-    parameters.add(TemporaryPath, temporaryPath)
-    this
-  }
-
 }
 
 object ALS {
 
   import MatrixFactorization._
-
-  // ========================================= Parameters ==========================================
-
-  case object TemporaryPath extends Parameter[String] {
-    val defaultValue: Option[String] = None
-  }
 
   // ==================================== ALS type definitions =====================================
 

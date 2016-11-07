@@ -117,6 +117,16 @@ import scala.collection.JavaConverters._
   *  changing the learning rate during the iterations. SGD can only reach convergence when the
   *  learning rate is decreasing to zero.
   *  (Default value: '''initialLearningRate / sqrt(currentIteration)''')
+  *
+  *  - [[org.apache.flink.ml.recommendation.MatrixFactorization.TemporaryPath]]:
+  *  Path to a temporary directory into which intermediate results are stored. If
+  *  this value is set, then the algorithm is split into three preprocessing steps, the SGD
+  *  iteration and a post-processing step which unblocks the factor matrices. The result of the
+  *  individual steps are stored in the specified directory. By splitting the algorithm into
+  *  multiple smaller steps, Flink does not have to split the available memory amongst too many
+  *  operators. This allows the system to process bigger individual messages and improves the
+  *  overall performance.
+  *  (Default value: '''None''')
   */
 class SGDforMatrixFactorization extends MatrixFactorization[SGDforMatrixFactorization] {
 
@@ -264,6 +274,7 @@ object SGDforMatrixFactorization {
       val lambda = resultParameters(Lambda)
       val learningRate = resultParameters(LearningRate)
       val learningRateMethod = resultParameters(LearningRateMethod)
+      val persistencePath = resultParameters.get(TemporaryPath)
 
       val ratings = input
 
@@ -272,15 +283,22 @@ object SGDforMatrixFactorization {
       // without having to refer to the user or item ids directly. This way we don't have to use
       // these ids during the iteration. Thus, for doing the unblocking at the end,
       // we need to store information about the user and item ids.
-      val (initialUserBlocks, userIdxInBlock, userUnblockInfo) =
+      val (initialUserBlocks, userIdxInBlock, userUnblockInfoUnpersisted) =
         initFactorBlockAndIndices(ratings.map(_._1), isUser = true, numBlocks, seed, factors)
-      val (initialItemBlocks, itemIdxInBlock, itemUnblockInfo) =
+      val (initialItemBlocks, itemIdxInBlock, itemUnblockInfoUnpersisted) =
         initFactorBlockAndIndices(ratings.map(_._2), isUser = false, numBlocks, seed, factors)
+
+      val (userUnblockInfo, itemUnblockInfo) = persistencePath match {
+        case Some(path) => FlinkMLTools.persist(
+          userUnblockInfoUnpersisted, itemUnblockInfoUnpersisted,
+          path + "userUnblockInfo", path + "itemUnblockInfo")
+        case None => (userUnblockInfoUnpersisted, itemUnblockInfoUnpersisted)
+      }
 
       // Constructing the rating blocks. There are numBlocks * numBlocks rating blocks.
       // todo maybe optimize 3-way join
       // todo is forwarded fields effective when using map instead of apply at the end of join?
-      val ratingBlocks = ratings
+      val ratingBlocksUnpersisted = ratings
         .join(userIdxInBlock).where(_._1).equalTo(0)
         .join(itemIdxInBlock).where(_._1._2).equalTo(0)
         // matching the indices in the factor blocks (user and item) with the ratings
@@ -306,15 +324,25 @@ object SGDforMatrixFactorization {
         }
         .withForwardedFields("_1->id")
 
+      val ratingBlocks = persistencePath match {
+        case Some(path) => FlinkMLTools.persist(ratingBlocksUnpersisted, path + "ratingBlocks")
+        case None => ratingBlocksUnpersisted
+      }
+
       // We union the user and item blocks so that we can use them as one [[DataSet]]
       // in the iteration.
       val initUserItem = initialUserBlocks.union(initialItemBlocks)
 
       // Iteratively updating the factors. We sweep through numBlocks rating blocks
       // in one iteration, thus we sweep through the whole rating matrix in numBlocks iterations.
-      val userItem = initUserItem.iterate(iterations * numBlocks) {
+      val userItemUnpersisted = initUserItem.iterate(iterations * numBlocks) {
         ui => updateFactors(ui, ratingBlocks, learningRate, learningRateMethod,
           lambda, numBlocks, seed)
+      }
+
+      val userItem = persistencePath match {
+        case Some(path) => FlinkMLTools.persist(userItemUnpersisted, path + "userItem")
+        case None => userItemUnpersisted
       }
 
       // unblocking the user and item matrices
@@ -509,7 +537,8 @@ object SGDforMatrixFactorization {
         .withForwardedFields("_1._1->_2.id", "_1._2->_1", "_2._2->_3")
         .groupBy(0).reduceGroup {
         users => {
-          val arr = users.toArray
+          // todo eliminate sorting, only needed for deterministic result
+          val arr = users.toArray.sortBy(_._2.id)
           val factors = arr.map(_._2)
           val omegas = arr.map(_._3)
           val factorBlockId = arr(0)._1
