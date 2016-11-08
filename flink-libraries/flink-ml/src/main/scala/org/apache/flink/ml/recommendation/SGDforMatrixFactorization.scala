@@ -42,14 +42,12 @@ import scala.collection.JavaConverters._
   *
   * In order to find the user and item matrix, the following problem is solved:
   *
-  * todo what is the loss function?
   * `argmin_{U,V} sum_(i,j\ with\ r_{i,j} != 0) (r_{i,j} - u_{i}^Tv_{j})^2 +
-  * lambda (sum_(i) n_{u_i} ||u_i||^2 + sum_(j) n_{v_j} ||v_j||^2)`
+  * lambda (sum_(i) ||u_i||^2 + sum_(j) ||v_j||^2)`
   *
-  * with `\lambda` being the regularization factor, `n_{u_i}` being the number of items the user `i`
-  * has rated and `n_{v_j}` being the number of times the item `j` has been rated. This
-  * regularization scheme to avoid overfitting is called weighted-lambda-regularization. Details
-  * can be found in the work of [[http://dx.doi.org/10.1007/978-3-540-68880-8_32 Zhou et al.]].
+  * with `\lambda` being the regularization factor. This is the L2 regularization scheme to avoid
+  * overfitting. Details can be found in the work of
+  * [[http://dx.doi.org/10.1007/s10115-013-0682-2 Yu et al.]]
   *
   * We randomly create user and item vectors, then randomly partition them into `k` user
   * and `k` item blocks. Based on these factor blocks we partition the rating matrix to `k * k`
