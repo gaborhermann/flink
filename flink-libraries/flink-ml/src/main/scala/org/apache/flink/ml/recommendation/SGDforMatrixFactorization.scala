@@ -21,7 +21,7 @@ package org.apache.flink.ml.recommendation
 import java.lang.Iterable
 
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
-import org.apache.flink.api.common.functions.{MapFunction, RichCoGroupFunction, RichMapFunction}
+import org.apache.flink.api.common.functions.{RichCoGroupFunction, RichMapFunction}
 import org.apache.flink.api.scala._
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.ml.common._
@@ -51,18 +51,36 @@ import scala.collection.JavaConverters._
   * [[http://dx.doi.org/10.1007/s10115-013-0682-2 Yu et al.]]
   *
   * We randomly create user and item vectors, then randomly partition them into `k` user
-  * and `k` item blocks. Based on these factor blocks we partition the rating matrix to `k * k`
-  * blocks correspondingly.
+  * and `k` item blocks (`k` can be set by
+  * [[org.apache.flink.ml.recommendation.MatrixFactorization.Blocks]]).
   *
-  * In one iteration step we choose `k` non-conflicting rating blocks, i.e. we should not choose
-  * two rating blocks simultaneously with the same user or item block. This is done by assigning
-  * a rating block ID to every user and item block. We match the user, item, and rating blocks by
-  * the current rating block ID, and update the user and item factors by the ratings locally.
+  * Based on these factor blocks we partition the rating matrix to `k * k` blocks correspondingly.
+  *
+  * In one Flink iteration step we choose `k` non-conflicting rating blocks,
+  * i.e. we should not choose two rating blocks simultaneously with the same user or item block.
+  *
+  * E.g. three different choices for `k = 3`
+  *
+  *  --------      --------      --------
+  * |xx|  |  |    |  |  |xx|    |  |xx|  |
+  * |--------|    |--------|    |--------|
+  * |  |xx|  |    |xx|  |  |    |  |  |xx|
+  * |--------|    |--------|    |--------|
+  * |  |  |xx|    |  |xx|  |    |xx|  |  |
+  *  --------      --------      --------
+  *
+  * Choosing such blocks is done by assigning a rating block ID to every user and item block.
+  * We match the user, item, and rating blocks by the current rating block ID,
+  * and update the user and item factors by gradients calculated locally from the ratings and
+  * the corresponding user and item factors. This update is the logic of SGD.
   * We also update the rating block ID for the factor blocks, thus in the next iteration we use
   * other rating blocks to update the factors.
   *
-  * In `k` iteration we sweep through the whole rating matrix of `k * k` blocks (so instead of
-  * the given number of iteration steps we do `k * numberOfIterationSteps` iterations).
+  * In `k` Flink iteration we sweep through the whole rating matrix of `k * k` blocks.
+  * Thus, `k` Flink iterations correspond to 1 iteration that considers all data,
+  * so instead of the given number of iteration steps
+  * (set at [[org.apache.flink.ml.recommendation.MatrixFactorization.Iterations]])
+  * we perform `k * numberOfIterationSteps` Flink iterations.
   *
   * The matrix `R` is given in its sparse representation as a tuple of `(i, j, r)` where `i` is the
   * row index, `j` is the column index and `r` is the matrix value at position `(i,j)`.
@@ -306,7 +324,7 @@ object SGDforMatrixFactorization {
           case (((user, item, rating), (_, userIdx, userBlockId)), (_, itemIdx, itemBlockId)) =>
             (toRatingBlockId(userBlockId, itemBlockId, numBlocks),
               RatingInfo(rating, userIdx, itemIdx),
-              // todo eliminate this last item, only needed for deterministic result
+              // todo maybe eliminate this last item, only needed for deterministic result
               (user, item))
         })
         .withForwardedFields("_1._2._2->_2.userIdx", "_2._2->_2.itemIdx", "_1._1._3->_2.rating",
@@ -495,7 +513,7 @@ object SGDforMatrixFactorization {
       }).withForwardedFieldsFirst("factorBlockId", "isUser", "omegas")
   }
 
-  // ============================== Blocking helper functions ======================================
+  // =============================== Block helper functions ========================================
 
   /**
     * Initializes blocks for one factor matrix (either user or item).

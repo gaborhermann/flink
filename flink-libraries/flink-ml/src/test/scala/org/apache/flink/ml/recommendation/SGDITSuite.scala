@@ -58,10 +58,12 @@ class SGDITSuite
 
     val predictions = dsgd.predict(testData).collect()
 
+    // fixme: remove these from the final version
     val userFacts = dsgd.factorsOption.get._1.collect
     val itemFacts = dsgd.factorsOption.get._2.collect
     predictions.foreach(println)
     println("------------------")
+    // fixme: remove these from the final version
 
     predictions.length should equal(expectedResultSGD.length)
 
