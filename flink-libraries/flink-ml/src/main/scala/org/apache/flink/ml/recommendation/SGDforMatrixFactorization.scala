@@ -21,8 +21,9 @@ package org.apache.flink.ml.recommendation
 import java.lang.Iterable
 
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
-import org.apache.flink.api.common.functions.RichCoGroupFunction
+import org.apache.flink.api.common.functions.{MapFunction, RichCoGroupFunction, RichMapFunction}
 import org.apache.flink.api.scala._
+import org.apache.flink.configuration.Configuration
 import org.apache.flink.ml.common._
 import org.apache.flink.ml.optimization.LearningRateMethod.{Default, LearningRateMethodTrait}
 import org.apache.flink.ml.pipeline.FitOperation
@@ -266,7 +267,7 @@ object SGDforMatrixFactorization {
       val resultParameters = instance.parameters ++ fitParameters
 
       val numBlocks = resultParameters.get(Blocks).getOrElse(1)
-      val seed = resultParameters(Seed)
+      val seed = resultParameters.get(Seed)
       val factors = resultParameters(NumFactors)
       val iterations = resultParameters(Iterations)
       val lambda = resultParameters(Lambda)
@@ -314,8 +315,11 @@ object SGDforMatrixFactorization {
         .groupBy(0)
         .reduceGroup {
           ratings =>
-            // todo eliminate sorting, only needed for deterministic result
-            val arr = ratings.toArray.sortBy(_._3)
+            val arr = seed match {
+              // sorting is only needed for deterministic result, i.e. when the seed is set
+              case Some(_) => ratings.toArray.sortBy(_._3)
+              case None => ratings.toArray
+            }
             val ratingBlockId = arr(0)._1
             val ratingInfos = arr.map(_._2)
             RatingBlock(ratingBlockId, ratingInfos)
@@ -362,7 +366,7 @@ object SGDforMatrixFactorization {
                     learningRateMethod: LearningRateMethodTrait,
                     lambda: Double,
                     numBlocks: Int,
-                    seed: Long): DataSet[FactorBlock] = {
+                    seed: Option[Long]): DataSet[FactorBlock] = {
 
     /**
       * Updates one user and item block based on one corresponding rating block.
@@ -384,7 +388,7 @@ object SGDforMatrixFactorization {
       val FactorBlock(_, _, _, users, userOmegas) = userBlock
       val FactorBlock(_, _, _, items, itemOmegas) = itemBlock
 
-      val random = new Random(iteration ^ ratingBlockId ^ seed)
+      val random = seed.map(s => new Random(iteration ^ ratingBlockId ^ s)).getOrElse(Random)
       val shuffleIdxs = random.shuffle[Int, IndexedSeq](ratings.indices)
 
       shuffleIdxs.map(ratingIdx => ratings(ratingIdx)) foreach {
@@ -508,15 +512,26 @@ object SGDforMatrixFactorization {
   def initFactorBlockAndIndices(factorIdsForRatings: DataSet[Int],
                                 isUser: Boolean,
                                 numBlocks: Int,
-                                seed: Long,
+                                seed: Option[Long],
                                 factors: Int):
   (DataSet[FactorBlock], DataSet[(Int, Int, FactorBlockId)], DataSet[UnblockInformation]) = {
 
     val factorIDs = factorIdsForRatings.distinct()
 
-    val factorBlockIds: DataSet[(Int, FactorBlockId)] = factorIDs.map(id =>
-      (id, new Random(id ^ seed).nextInt(numBlocks))
-    )
+    val factorBlockIds: DataSet[(Int, FactorBlockId)] = factorIDs
+      .map(new RichMapFunction[Int, (Int, FactorBlockId)] {
+        @transient
+        var random: Random = _
+
+        override def open(parameters: Configuration): Unit = {
+          random = Random
+        }
+
+        override def map(id: Int): (Int, RatingBlockId) = {
+          val currentRandom = seed.map(s => new Random(id ^ s)).getOrElse(random)
+          (id, currentRandom.nextInt(numBlocks))
+        }
+      })
 
     val factorCounts = factorIdsForRatings
       .map((_, 1))
@@ -529,14 +544,17 @@ object SGDforMatrixFactorization {
         .join(factorCounts).where(0).equalTo(0)
         .map(_ match {
           case ((id, factorBlockId), (_, count)) =>
-            val random = new Random(id ^ seed)
+            val random = seed.map(s => new Random(id ^ s)).getOrElse(Random)
             (factorBlockId, Factors(id, randomFactors(factors, random)), count)
         })
         .withForwardedFields("_1._1->_2.id", "_1._2->_1", "_2._2->_3")
         .groupBy(0).reduceGroup {
         users => {
-          // todo eliminate sorting, only needed for deterministic result
-          val arr = users.toArray.sortBy(_._2.id)
+          val arr = seed match {
+            // sorting is only needed for deterministic result, i.e. when the seed is set
+            case Some(_) => users.toArray.sortBy(_._2.id)
+            case None => users.toArray
+          }
           val factors = arr.map(_._2)
           val omegas = arr.map(_._3)
           val factorBlockId = arr(0)._1
