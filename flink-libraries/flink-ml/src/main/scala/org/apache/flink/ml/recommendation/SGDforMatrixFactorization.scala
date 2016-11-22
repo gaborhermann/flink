@@ -190,7 +190,7 @@ object SGDforMatrixFactorization {
   /**
     * Index of a factor in a factor block.
     */
-  type IndexInFactorBlock = Int
+  type IndexInFactorBlock = (FactorSubblockId, Int)
 
   /**
     * Representation of a rating in a rating block.
@@ -212,6 +212,7 @@ object SGDforMatrixFactorization {
     * Factor block identifier.
     */
   type FactorBlockId = Int
+  type FactorSubblockId = Int
 
   /**
     * Representation of a rating block.
@@ -219,7 +220,10 @@ object SGDforMatrixFactorization {
     * @param id Identifier of the block.
     * @param block Array containing the ratings corresponding to the block.
     */
-  case class RatingBlock(id: RatingBlockId, block: Array[RatingInfo])
+  case class RatingBlock(id: RatingBlockId,
+                         block: Array[RatingInfo],
+                         numOfUserSubblocks: Int,
+                         numOfItemSubblocks: Int)
 
   /**
     * Representation of a factor block.
@@ -232,19 +236,27 @@ object SGDforMatrixFactorization {
     * @param omegas Array containing the omegas for every factor,
     *               i.e. the number of occurrences of that factor in the ratings.
     */
-  case class FactorBlock(factorBlockId: FactorBlockId,
-                         currentRatingBlock: RatingBlockId,
-                         isUser: Boolean,
-                         factors: Array[Array[Double]],
-                         omegas: Array[Int])
+//  case class FactorBlock(factorBlockId: FactorBlockId,
+//                         currentRatingBlock: RatingBlockId,
+//                         isUser: Boolean,
+//                         factors: Array[Array[Double]],
+//                         omegas: Array[Int])
 
+  case class FactorSubblock(factorBlockId: FactorBlockId,
+                            factorSubblockId: FactorSubblockId,
+                            currentRatingBlock: RatingBlockId,
+                            isUser: Boolean,
+                            factors: Array[Array[Double]],
+                            omegas: Array[Int])
   /**
     * Information for unblocking the factors at the end of the algorithm.
     *
     * @param factorBlockId Id of the factor block.
     * @param factorIds Ids of the factors in the corresponding factor block.
     */
-  case class UnblockInformation(factorBlockId: FactorBlockId, factorIds: Array[Int])
+  case class UnblockInformation(factorBlockId: FactorBlockId,
+                                factorSubblockId: FactorSubblockId,
+                                factorIds: Array[Int])
 
   // ================================= Factory methods =============================================
 
@@ -259,14 +271,16 @@ object SGDforMatrixFactorization {
     *
     * @return [[DataSet]] containing the factors.
     */
-  def unblock(factorBlocks: DataSet[FactorBlock],
+  def unblock(factorBlocks: DataSet[FactorSubblock],
               unblockInfo: DataSet[UnblockInformation],
               isUser: Boolean): DataSet[Factors] = {
     factorBlocks
       .filter(i => i.isUser == isUser)
-      .join(unblockInfo).where(_.factorBlockId).equalTo(_.factorBlockId)
+      .join(unblockInfo)
+      .where(x => (x.factorBlockId, x.factorSubblockId))
+      .equalTo(x => (x.factorBlockId, x.factorSubblockId))
       .flatMap(x => x match {
-        case (FactorBlock(_, _, _, factorsInBlock, _), UnblockInformation(_, ids)) =>
+        case (FactorSubblock(_, _, _, _, factorsInBlock, _), UnblockInformation(_, _, ids)) =>
           ids.zip(factorsInBlock).map(x => Factors(x._1, x._2))
       })
   }
@@ -293,6 +307,9 @@ object SGDforMatrixFactorization {
       val learningRateMethod = resultParameters(LearningRateMethod)
       val persistencePath = resultParameters.get(TemporaryPath)
 
+      // fixme use parameter
+      val subblocksPerBlock = 10
+
       val ratings = input
 
       // Initializing user and item blocks.
@@ -301,9 +318,11 @@ object SGDforMatrixFactorization {
       // these ids during the iteration. Thus, for doing the unblocking at the end,
       // we need to store information about the user and item ids.
       val (initialUserBlocks, userIdxInBlock, userUnblockInfoUnpersisted) =
-        initFactorBlockAndIndices(ratings.map(_._1), isUser = true, numBlocks, seed, factors)
+        initFactorBlockAndIndices(
+          ratings.map(_._1), isUser = true, numBlocks, seed, factors, subblocksPerBlock)
       val (initialItemBlocks, itemIdxInBlock, itemUnblockInfoUnpersisted) =
-        initFactorBlockAndIndices(ratings.map(_._2), isUser = false, numBlocks, seed, factors)
+        initFactorBlockAndIndices(
+          ratings.map(_._2), isUser = false, numBlocks, seed, factors, subblocksPerBlock)
 
       val (userUnblockInfo, itemUnblockInfo) = persistencePath match {
         case Some(path) => FlinkMLTools.persist(
@@ -321,14 +340,17 @@ object SGDforMatrixFactorization {
         // matching the indices in the factor blocks (user and item) with the ratings
         // and creating rating block ids
         .map(_ match {
-          case (((user, item, rating), (_, userIdx, userBlockId)), (_, itemIdx, itemBlockId)) =>
+          case (((user, item, rating),
+          (_, userIdx, userBlockId, userSubblockId, userSubblocksPerBlock)),
+          (_, itemIdx, itemBlockId, itemSubblockId, itemSubblocksPerBlock)) =>
             (toRatingBlockId(userBlockId, itemBlockId, numBlocks),
-              RatingInfo(rating, userIdx, itemIdx),
+              RatingInfo(rating, (userSubblockId, userIdx), (itemSubblockId, itemIdx)),
               // todo maybe eliminate this last item, only needed for deterministic result
-              (user, item))
+              (user, item), (userSubblocksPerBlock, itemSubblocksPerBlock))
         })
-        .withForwardedFields("_1._2._2->_2.userIdx", "_2._2->_2.itemIdx", "_1._1._3->_2.rating",
-        "_1._1._1->_3._1", "_1._1._2->_3._2")
+        // fixme forwarded fields
+//        .withForwardedFields("_1._2._2->_2.userIdx", "_2._2->_2.itemIdx", "_1._1._3->_2.rating",
+//        "_1._1._1->_3._1", "_1._1._2->_3._2")
         // grouping by the rating block ids and constructing rating blocks
         .groupBy(0)
         .reduceGroup {
@@ -338,11 +360,17 @@ object SGDforMatrixFactorization {
               case Some(_) => ratings.toArray.sortBy(_._3)
               case None => ratings.toArray
             }
-            val ratingBlockId = arr(0)._1
+            val ratingFirst = arr(0)
+            val ratingBlockId = ratingFirst._1
             val ratingInfos = arr.map(_._2)
-            RatingBlock(ratingBlockId, ratingInfos)
+
+            val userSubblocks = ratingFirst._4._1
+            val itemSubblocks = ratingFirst._4._2
+
+            RatingBlock(ratingBlockId, ratingInfos, userSubblocks, itemSubblocks)
         }
-        .withForwardedFields("_1->id")
+        // fixme forwarded fields
+//        .withForwardedFields("_1->id")
 
       val ratingBlocks = persistencePath match {
         case Some(path) => FlinkMLTools.persist(ratingBlocksUnpersisted, path + "ratingBlocks")
@@ -373,18 +401,21 @@ object SGDforMatrixFactorization {
     }
   }
 
+//  case class FactorBlock(subblocks: Array[FactorSubblock])
+  type FactorBlock = Array[FactorSubblock]
+
   /** Calculates a single sweep for the SGD optimization. The result is the new value for
     * the user and item matrix.
     *
     * @return New values for the optimized matrices.
     */
-  def updateFactors(userItem: DataSet[FactorBlock],
+  def updateFactors(userItem: DataSet[FactorSubblock],
                     ratingBlocks: DataSet[RatingBlock],
                     learningRate: Double,
                     learningRateMethod: LearningRateMethodTrait,
                     lambda: Double,
                     numBlocks: Int,
-                    seed: Option[Long]): DataSet[FactorBlock] = {
+                    seed: Option[Long]): DataSet[FactorSubblock] = {
 
     /**
       * Updates one user and item block based on one corresponding rating block.
@@ -402,9 +433,28 @@ object SGDforMatrixFactorization {
         iteration + 1,
         lambda)
 
-      val RatingBlock(ratingBlockId, ratings) = ratingBlock
-      val FactorBlock(_, _, _, users, userOmegas) = userBlock
-      val FactorBlock(_, _, _, items, itemOmegas) = itemBlock
+      val RatingBlock(ratingBlockId, ratings, numOfUserSubblocks, numOfItemSubblocks) = ratingBlock
+
+      def setFactorsInBlock(block: FactorBlock)(idx: IndexInFactorBlock, factors: Array[Double]) = {
+        block(idx._1).factors.update(idx._2, factors)
+      }
+
+      def factorsInBlock(block: FactorBlock)(idx: IndexInFactorBlock) = {
+        block(idx._1).factors(idx._2)
+      }
+
+      def omegasInBlock(block: FactorBlock)(idx: IndexInFactorBlock) = {
+        block(idx._1).omegas(idx._2)
+      }
+
+      val setUser = setFactorsInBlock(userBlock)_
+      val setItem = setFactorsInBlock(itemBlock)_
+
+      val users = factorsInBlock(userBlock)_
+      val items = factorsInBlock(itemBlock)_
+
+      val userOmegas = omegasInBlock(userBlock)_
+      val itemOmegas = omegasInBlock(itemBlock)_
 
       val random = seed.map(s => new Random(iteration ^ ratingBlockId ^ s)).getOrElse(Random)
       val shuffleIdxs = random.shuffle[Int, IndexedSeq](ratings.indices)
@@ -426,12 +476,12 @@ object SGDforMatrixFactorization {
           val newQj = pi.zip(qj).map { case (p, q) =>
             q - effectiveLearningRate * (lambda / omegaj * q - piqj * p) }
 
-          users(rating.userIdx) = newPi
-          items(rating.itemIdx) = newQj
+          setUser(rating.userIdx, newPi)
+          setItem(rating.itemIdx, newQj)
         }
       }
 
-      (userBlock.copy(factors = users), itemBlock.copy(factors = items))
+      (userBlock, itemBlock)
     }
 
     /**
@@ -443,16 +493,23 @@ object SGDforMatrixFactorization {
       *
       * @return Optional user and item blocks and the current rating block id.
       */
-    def extractUserItemBlock(factorBlocks: Iterator[FactorBlock]):
-      (Option[FactorBlock], Option[FactorBlock], RatingBlockId) = {
-      val b1 = factorBlocks.next()
-      val b2 = factorBlocks.toIterable.headOption
+    def extractUserItemBlock(factorBlocks: Iterator[FactorSubblock],
+                             numOfUserSubblocks: Int,
+                             numOfItemSubblocks: Int):
+      (Array[FactorSubblock], Array[FactorSubblock]) = {
 
-      if (b1.isUser) {
-        (Some(b1), b2, b1.currentRatingBlock)
-      } else {
-        (b2, Some(b1), b1.currentRatingBlock)
-      }
+      val users = new Array[FactorSubblock](numOfUserSubblocks)
+      val items = new Array[FactorSubblock](numOfItemSubblocks)
+
+      // fixme for debug
+      val factorBlocks2 = factorBlocks.toList
+
+      factorBlocks2.foreach(subblock => {
+        val block = if (subblock.isUser) users else items
+        block.update(subblock.factorSubblockId, subblock)
+      })
+
+      (users, items)
     }
 
     // todo Consider left outer join.
@@ -465,11 +522,11 @@ object SGDforMatrixFactorization {
     userItem.coGroup(ratingBlocks)
       .where(factorBlock => factorBlock.currentRatingBlock)
       .equalTo(ratingBlock => ratingBlock.id).apply(
-      new RichCoGroupFunction[FactorBlock, RatingBlock, FactorBlock] {
+      new RichCoGroupFunction[FactorSubblock, RatingBlock, FactorSubblock] {
 
-        override def coGroup(factorBlocksJava: Iterable[FactorBlock],
+        override def coGroup(factorBlocksJava: Iterable[FactorSubblock],
                              ratingBlocksJava: Iterable[RatingBlock],
-                             out: Collector[FactorBlock]): Unit = {
+                             out: Collector[FactorSubblock]): Unit = {
 
           val factorBlocks = factorBlocksJava.asScala.iterator
           val ratingBlocks = ratingBlocksJava.asScala.iterator
@@ -480,37 +537,82 @@ object SGDforMatrixFactorization {
             // There are factors matched to the current rating block,
             // so we are updating those factors by the current rating block.
 
-            // There are two factor blocks, one user and one item.
-            // One of them might be missing when there is no rating block,
-            // so we use options.
-            val (userBlock, itemBlock, currentRatingBlock) = extractUserItemBlock(factorBlocks)
+            val factorBlocksIter = factorBlocks.buffered
 
-            val (updatedUserBlock, updatedItemBlock) =
+            val currentRatingBlockId = factorBlocksIter.head.currentRatingBlock
+            val (newP, newQ) = nextRatingBlock(currentRatingBlockId, numBlocks)
+
+            val updatedFactors =
               if (ratingBlocks.hasNext) {
                 // there is one rating block
                 val ratingBlock = ratingBlocks.next()
 
+                // there must be subblocks (both user and item) because there are ratings
+                val (userBlock, itemBlock) = extractUserItemBlock(factorBlocksIter,
+                  ratingBlock.numOfUserSubblocks, ratingBlock.numOfItemSubblocks)
+
                 val currentIteration = getIterationRuntimeContext.getSuperstepNumber / numBlocks
 
                 val (userB, itemB) =
-                  updateLocalFactors(ratingBlock, userBlock.get, itemBlock.get, currentIteration)
+                  updateLocalFactors(ratingBlock, userBlock, itemBlock, currentIteration)
 
-                (Some(userB), Some(itemB))
+                userB.map(_.copy(currentRatingBlock = newP)).iterator ++
+                  itemB.map(_.copy(currentRatingBlock = newQ)).iterator
               } else {
                 // There are no ratings in the current block, so we do not update the factors,
-                // just pass them forward.
+                // just pass them forward with the next rating block ids.
 
-                (userBlock, itemBlock)
+                factorBlocksIter.map(x => {
+                  if (x.isUser) {
+                    x.copy(currentRatingBlock = newP)
+                  } else {
+                    x.copy(currentRatingBlock = newQ)
+                  }
+                })
               }
 
-            // calculating the next rating block for the factor blocks
-            val (newP, newQ) = nextRatingBlock(currentRatingBlock, numBlocks)
-
-            updatedUserBlock.foreach(x => out.collect(x.copy(currentRatingBlock = newP)))
-            updatedItemBlock.foreach(x => out.collect(x.copy(currentRatingBlock = newQ)))
+            updatedFactors.foreach(out.collect)
           }
+
+//          // We only need to update factors by the current rating block
+//          // if there are factors matched to that rating block.
+//          if (factorBlocks.hasNext) {
+//            // There are factors matched to the current rating block,
+//            // so we are updating those factors by the current rating block.
+//
+//            // There are two factor blocks, one user and one item.
+//            // One of them might be missing when there is no rating block,
+//            // so we use options.
+//            val (userBlock, itemBlock, currentRatingBlock) = extractUserItemBlock(factorBlocks)
+//
+//            val (updatedUserBlock, updatedItemBlock) =
+//              if (ratingBlocks.hasNext) {
+//                // there is one rating block
+//                val ratingBlock = ratingBlocks.next()
+//
+//                val currentIteration = getIterationRuntimeContext.getSuperstepNumber / numBlocks
+//
+//                val (userB, itemB) =
+//                  updateLocalFactors(ratingBlock, userBlock.get, itemBlock.get, currentIteration)
+//
+//                (Some(userB), Some(itemB))
+//              } else {
+//                // There are no ratings in the current block, so we do not update the factors,
+//                // just pass them forward.
+//
+//                (userBlock, itemBlock)
+//              }
+//
+//            // calculating the next rating block for the factor blocks
+//            val (newP, newQ) = nextRatingBlock(currentRatingBlock, numBlocks)
+//
+//            updatedUserBlock.foreach(x => out.collect(x.copy(currentRatingBlock = newP)))
+//            updatedItemBlock.foreach(x => out.collect(x.copy(currentRatingBlock = newQ)))
+//          }
         }
-      }).withForwardedFieldsFirst("factorBlockId", "isUser", "omegas")
+      })
+    // fixme forwarded
+//      .withForwardedFieldsFirst("factorBlockId", "isUser", "omegas")
   }
 
   // =============================== Block helper functions ========================================
@@ -531,8 +633,10 @@ object SGDforMatrixFactorization {
                                 isUser: Boolean,
                                 numBlocks: Int,
                                 seed: Option[Long],
-                                factors: Int):
-  (DataSet[FactorBlock], DataSet[(Int, Int, FactorBlockId)], DataSet[UnblockInformation]) = {
+                                factors: Int,
+                                subblocksPerBlock: Int):
+  (DataSet[FactorSubblock],
+    DataSet[(Int, Int, FactorBlockId, FactorSubblockId, Int)], DataSet[UnblockInformation]) = {
 
     val factorIDs = factorIdsForRatings.distinct()
 
@@ -566,42 +670,85 @@ object SGDforMatrixFactorization {
             (factorBlockId, Factors(id, randomFactors(factors, random)), count)
         })
         .withForwardedFields("_1._1->_2.id", "_1._2->_1", "_2._2->_3")
-        .groupBy(0).reduceGroup {
-        users => {
-          val arr = seed match {
-            // sorting is only needed for deterministic result, i.e. when the seed is set
-            case Some(_) => users.toArray.sortBy(_._2.id)
-            case None => users.toArray
+        .groupBy(0)
+        .reduceGroup {
+          (users: Iterator[(FactorBlockId, Factors, RatingBlockId)],
+           out: Collector[(FactorSubblock, Array[Int], Int)]) => {
+            val arr = seed match {
+              // sorting is only needed for deterministic result, i.e. when the seed is set
+              case Some(_) => users.toArray.sortBy(_._2.id)
+              case None => users.toArray
+            }
+            val factors = arr.map(_._2)
+
+            if (factors.length > 0) {
+              val omegas = arr.map(_._3)
+              val factorBlockId = arr(0)._1
+              val initialRatingBlock = factorBlockId * (numBlocks + 1)
+
+              val factorIds = factors.map(_.id)
+
+              val factorsPerSubblock =
+                if (factors.length / subblocksPerBlock > 0) {
+                  factors.length / subblocksPerBlock
+                } else {
+                  1
+                }
+
+              val numOfSubblocks =
+                if (factors.length % factorsPerSubblock == 0) {
+                  factors.length / factorsPerSubblock
+                } else {
+                  (factors.length / factorsPerSubblock) + 1
+                }
+
+              val subblockFactors = factors.map(_.factors).grouped(factorsPerSubblock)
+              val subblockOmegas = omegas.grouped(factorsPerSubblock)
+
+              val subblockFactorIds = factorIds.grouped(factorsPerSubblock)
+
+              val output = subblockFactors.zip(subblockOmegas).zip(subblockFactorIds).zipWithIndex
+                .map {
+                  case (((subbFactors, subbOmegas), subbFactorIds), subblockId) =>
+                    (FactorSubblock(factorBlockId, subblockId, initialRatingBlock, isUser,
+                      subbFactors, subbOmegas),
+                      subbFactorIds, numOfSubblocks)
+                }
+
+              // fixme for debugging
+              val output2 = output.toList
+
+              output2.foreach(out.collect)
+            }
           }
-          val factors = arr.map(_._2)
-          val omegas = arr.map(_._3)
-          val factorBlockId = arr(0)._1
-          val initialRatingBlock = factorBlockId * (numBlocks + 1)
-
-          val factorIds = factors.map(_.id)
-
-          (FactorBlock(factorBlockId, initialRatingBlock, isUser, factors.map(_.factors), omegas),
-            factorIds)
-        }
-      }.withForwardedFields("_1->_1.factorBlockId")
+      }
+        // fixme refactor forwarded fields
+//        .withForwardedFields("_1->_1.factorBlockId")
 
     val unblockInfo = initialFactorBlocks
-      .map(x => UnblockInformation(x._1.factorBlockId, x._2))
-      .withForwardedFields("_1.factorBlockId->factorBlockId", "_2->factorIds")
+      .map(x => UnblockInformation(x._1.factorBlockId, x._1.factorSubblockId, x._2))
+      // fixme refactor forwarded fields
+//      .withForwardedFields("_1.factorBlockId->factorBlockId", "_2->factorIds")
 
-    val factorIdxInBlock = unblockInfo
+    val factorIdxInBlock = initialFactorBlocks
       .flatMap {
         _ match {
-          case UnblockInformation(factorBlockId, ids) =>
+          case (FactorSubblock(factorBlockId, factorSubblockId, _, _, _, _),
+            ids, totalNumOfSubblocksPerBlock) =>
+//          case UnblockInformation(factorBlockId, factorSubblockId, ids) =>
             ids.zipWithIndex.map {
               case (id, idx) =>
-                (id, idx, factorBlockId)
+                (id, idx, factorBlockId, factorSubblockId, totalNumOfSubblocksPerBlock)
             }
         }
       }
-      .withForwardedFields("factorBlockId->_3")
+      // fixme refactor forwarded fields
+//      .withForwardedFields("factorBlockId->_3")
 
-    (initialFactorBlocks.map(_._1).withForwardedFields("_1->*"), factorIdxInBlock, unblockInfo)
+    (initialFactorBlocks.map(_._1)
+      // fixme forwarded
+//      .withForwardedFields("_1->*")
+      , factorIdxInBlock, unblockInfo)
   }
 
   // ================ Helper functions for matching rating and factor blocks =======================
