@@ -21,7 +21,8 @@ package org.apache.flink.ml.recommendation
 import java.lang.Iterable
 
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
-import org.apache.flink.api.common.functions.{RichCoGroupFunction, RichMapFunction}
+import org.apache.flink.api.common.functions.{FlatJoinFunction, RichCoGroupFunction, RichFlatJoinFunction, RichMapFunction}
+import org.apache.flink.api.common.operators.base.JoinOperatorBase.JoinHint
 import org.apache.flink.api.scala._
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.ml.common._
@@ -455,62 +456,40 @@ object SGDforMatrixFactorization {
       }
     }
 
-    // todo Consider left outer join.
-    //   - pros
-    //      . it would eliminate rating block check (no need to "invoke" unused rating block)
-    //      . flexible underlying implementation (shipping/local strategy)
-    //   - cons
-    //      . has to aggregate the two factor blocks in the join function
-    // Matching the user and item blocks to the current rating block.
-    userItem.coGroup(ratingBlocks)
-      .where(factorBlock => factorBlock.currentRatingBlock)
-      .equalTo(ratingBlock => ratingBlock.id).apply(
-      new RichCoGroupFunction[FactorBlock, RatingBlock, FactorBlock] {
+    type ExtractedUserItem = (Option[FactorBlock], Option[FactorBlock], RatingBlockId)
 
-        override def coGroup(factorBlocksJava: Iterable[FactorBlock],
-                             ratingBlocksJava: Iterable[RatingBlock],
-                             out: Collector[FactorBlock]): Unit = {
+    userItem
+      .groupBy("currentRatingBlock")
+      .reduceGroup(iter => extractUserItemBlock(iter))
+//      .withForwardedFields("currentRatingBlock->_3")
+      .leftOuterJoin(ratingBlocks, JoinHint.REPARTITION_HASH_SECOND).where("_3").equalTo("id")
+      .apply(
+        new RichFlatJoinFunction[ExtractedUserItem, RatingBlock, FactorBlock] {
+          override def join(optionUserItem: ExtractedUserItem,
+                            ratingBlock: RatingBlock,
+                            out: Collector[FactorBlock]): Unit = {
 
-          val factorBlocks = factorBlocksJava.asScala.iterator
-          val ratingBlocks = ratingBlocksJava.asScala.iterator
+            val currentRatingBlock = ratingBlock.id
+            val (nextP, nextQ) = nextRatingBlock(currentRatingBlock, numBlocks)
 
-          // We only need to update factors by the current rating block
-          // if there are factors matched to that rating block.
-          if (factorBlocks.hasNext) {
-            // There are factors matched to the current rating block,
-            // so we are updating those factors by the current rating block.
-
-            // There are two factor blocks, one user and one item.
-            // One of them might be missing when there is no rating block,
-            // so we use options.
-            val (userBlock, itemBlock, currentRatingBlock) = extractUserItemBlock(factorBlocks)
+            val currentIteration = getIterationRuntimeContext.getSuperstepNumber / numBlocks
 
             val (updatedUserBlock, updatedItemBlock) =
-              if (ratingBlocks.hasNext) {
-                // there is one rating block
-                val ratingBlock = ratingBlocks.next()
-
-                val currentIteration = getIterationRuntimeContext.getSuperstepNumber / numBlocks
-
-                val (userB, itemB) =
-                  updateLocalFactors(ratingBlock, userBlock.get, itemBlock.get, currentIteration)
-
-                (Some(userB), Some(itemB))
-              } else {
-                // There are no ratings in the current block, so we do not update the factors,
-                // just pass them forward.
-
-                (userBlock, itemBlock)
+              optionUserItem match {
+                case (Some(userBlock), Some(itemBlock), _) =>
+                  val (u, i) =
+                    updateLocalFactors(ratingBlock, userBlock, itemBlock, currentIteration)
+                  (Some(u), Some(i))
+                case (optUser, optItem, _) => (optUser, optItem)
               }
 
-            // calculating the next rating block for the factor blocks
-            val (newP, newQ) = nextRatingBlock(currentRatingBlock, numBlocks)
-
-            updatedUserBlock.foreach(x => out.collect(x.copy(currentRatingBlock = newP)))
-            updatedItemBlock.foreach(x => out.collect(x.copy(currentRatingBlock = newQ)))
+            updatedUserBlock.foreach(x => out.collect(x.copy(currentRatingBlock = nextP)))
+            updatedItemBlock.foreach(x => out.collect(x.copy(currentRatingBlock = nextQ)))
           }
-        }
-      }).withForwardedFieldsFirst("factorBlockId", "isUser", "omegas")
+        })
+    // cannot forward these with left outer join
+      //.withForwardedFieldsFirst("factorBlockId", "isUser", "omegas")
+
   }
 
   // =============================== Block helper functions ========================================
